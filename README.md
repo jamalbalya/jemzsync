@@ -240,12 +240,14 @@ Obsidian's automated review flags both of these. Neither is accidental.
 
 **Clipboard.** The plugin writes to the clipboard, never reads it. It happens only when you press a button: **Copy** on the fingerprint, **Copy commands** on the migration steps, or the *Copy vault fingerprint* command. What lands there is a sixteen-character digest or a block of shell commands. Nothing is read back, and nothing is copied without a click.
 
-**`localStorage` instead of the plugin data API.** This one looks like a shortcut and is the opposite of one. Obsidian's `saveData` writes into the vault — and this vault is being replicated by iCloud or Google Drive, which is the entire point of the plugin. Two pieces of state must *not* travel:
+**Per-device state kept out of `saveData`.** Obsidian's `saveData` writes into the vault — and this vault is being replicated by iCloud or Google Drive, which is the entire point of the plugin. Two pieces of state must *not* travel:
 
-- **The device ID.** Every device must have a different one. Stored through `saveData`, the first device's ID would sync to the second, both would claim the same identity, and the Devices panel could never tell them apart.
+- **The device ID.** Every device needs a different one. Stored through `saveData`, the first device's ID would sync to the second, both would claim the same identity, and the Devices panel could never tell them apart.
 - **The "don't warn me again" dismissal.** Dismissing the setup warning on a correctly configured Mac must not silence it on an iPhone that is still misconfigured.
 
-Both live in `localStorage`, which is per app install and never syncs. Everything that *should* be shared — scan preferences, exclusions, the paired fingerprint — goes through `saveData` as normal. There is a test asserting the beacon never feeds the fingerprint for the same reason.
+Both go through `app.saveLocalStorage` / `app.loadLocalStorage`, Obsidian's own API for exactly this: stored on the device, never synced, and scoped per vault — so two vaults open on the same Mac get separate identities rather than quietly sharing one. Everything that *should* be shared — scan preferences, exclusions, the paired fingerprint — goes through `saveData` as normal.
+
+Nine tests drive this against a fake app, including that two vaults never collide, that a dismissal in one does not silence another, and that a build without the storage API degrades to an ephemeral ID instead of throwing.
 
 ---
 

@@ -1399,6 +1399,110 @@ async function ecosystemTests() {
 	});
 }
 
+/* ================= per-device state ================= */
+
+/** Stand-in for Obsidian's App, storing exactly what the real one would. */
+function fakeApp() {
+	const store = Object.create(null);
+	return {
+		store: store,
+		loadLocalStorage(key) {
+			return Object.prototype.hasOwnProperty.call(store, key) ? store[key] : null;
+		},
+		saveLocalStorage(key, data) {
+			if (data === null || data === undefined) delete store[key];
+			else store[key] = String(data);
+		},
+	};
+}
+
+async function deviceStateTests() {
+	const D = plugin.__device;
+
+	group('per-device state (never syncs, scoped per vault)');
+
+	await test('an id is generated and then reused across reloads', () => {
+		const app = fakeApp();
+		const first = D.loadDeviceIdentity(app).id;
+		assert.ok(/^[a-z0-9]{8}$/.test(first));
+		assert.strictEqual(D.loadDeviceIdentity(app).id, first);
+		assert.strictEqual(D.loadDeviceIdentity(app).id, first);
+	});
+
+	await test('two vaults on the same device get different identities', () => {
+		// The reason for app.saveLocalStorage over the raw localStorage object:
+		// raw storage is per install, so both vaults would have shared one id.
+		const a = D.loadDeviceIdentity(fakeApp()).id;
+		const b = D.loadDeviceIdentity(fakeApp()).id;
+		assert.notStrictEqual(a, b);
+	});
+
+	await test('nothing is written through the vault-syncing data API', () => {
+		// Everything must land in local storage; if any of it reached saveData
+		// it would sync, and every device would claim the same identity.
+		const app = fakeApp();
+		D.loadDeviceIdentity(app);
+		D.saveDeviceName(app, 'Studio Mac');
+		D.saveDismissedWarning(app, 'local-only');
+		assert.deepStrictEqual(Object.keys(app.store).sort(), [
+			'jemzsync-device-id',
+			'jemzsync-device-name',
+			'jemzsync-dismissed-location',
+		]);
+	});
+
+	await test('a chosen device name survives a reload', () => {
+		const app = fakeApp();
+		D.loadDeviceIdentity(app);
+		D.saveDeviceName(app, 'Studio Mac');
+		assert.strictEqual(D.loadDeviceIdentity(app).name, 'Studio Mac');
+	});
+
+	await test('an unnamed device falls back to a sensible default', () => {
+		const id = D.loadDeviceIdentity(fakeApp());
+		assert.ok(id.name && id.name.length);
+	});
+
+	await test('a dismissal round-trips and is absent until set', () => {
+		const app = fakeApp();
+		assert.strictEqual(D.loadDismissedWarning(app), null);
+		D.saveDismissedWarning(app, 'local-only');
+		assert.strictEqual(D.loadDismissedWarning(app), 'local-only');
+	});
+
+	await test('a dismissal in one vault does not silence another', () => {
+		const mac = fakeApp();
+		const phone = fakeApp();
+		D.saveDismissedWarning(mac, 'local-only');
+		assert.strictEqual(D.loadDismissedWarning(phone), null);
+	});
+
+	await test('an app without the storage API degrades instead of throwing', () => {
+		// Older builds, or private mode. An ephemeral id beats a failed load.
+		for (const app of [null, {}, { loadLocalStorage: null }]) {
+			const id = D.loadDeviceIdentity(app);
+			assert.ok(/^[a-z0-9]{8}$/.test(id.id));
+			assert.doesNotThrow(() => D.saveDeviceName(app, 'x'));
+			assert.doesNotThrow(() => D.saveDismissedWarning(app, 'y'));
+			assert.strictEqual(D.loadDismissedWarning(app), null);
+		}
+	});
+
+	await test('storage that throws is survivable', () => {
+		const hostile = {
+			loadLocalStorage() {
+				throw new Error('quota');
+			},
+			saveLocalStorage() {
+				throw new Error('quota');
+			},
+		};
+		const id = D.loadDeviceIdentity(hostile);
+		assert.ok(/^[a-z0-9]{8}$/.test(id.id));
+		assert.doesNotThrow(() => D.saveDismissedWarning(hostile, 'z'));
+	});
+}
+
 /* ================= runner ================= */
 
 (async function run() {
@@ -1414,6 +1518,7 @@ async function ecosystemTests() {
 	await beaconTests();
 	await scannerBeaconTests();
 	await ecosystemTests();
+	await deviceStateTests();
 	await moduleTests();
 
 	console.log('\n' + '-'.repeat(46));

@@ -1251,70 +1251,90 @@ function defaultDeviceName() {
 	return 'Device';
 }
 
-/**
- * Identity lives in localStorage, which is per app install and never syncs.
- * That matters: the vault (including plugin settings) is shared through
- * iCloud, so anything stored there would give every device the same ID.
+/* ---------------------- per-device state ---------------------- *
+ *
+ * A small amount of state must NOT travel between devices, which rules out
+ * `saveData`: that writes into the vault, and the whole premise here is that
+ * the vault is being replicated by iCloud or Google Drive.
+ *
+ * `app.saveLocalStorage` / `app.loadLocalStorage` are Obsidian's own answer to
+ * this. They stay on the device and, unlike the raw `localStorage` object,
+ * they are scoped per vault — so two vaults open on the same Mac get separate
+ * device identities instead of quietly sharing one.
  */
-function loadDeviceIdentity() {
-	let store = null;
-	try {
-		store = typeof localStorage !== 'undefined' ? localStorage : null;
-	} catch (_) {
-		store = null;
-	}
 
-	let id = null;
-	let name = null;
-	if (store) {
-		try {
-			id = store.getItem('jemzsync-device-id');
-			if (!id) {
-				id = newDeviceId();
-				store.setItem('jemzsync-device-id', id);
-			}
-			name = store.getItem('jemzsync-device-name');
-		} catch (_) {
-			/* private mode or quota — fall back to ephemeral */
+function readLocal(app, key) {
+	try {
+		if (app && typeof app.loadLocalStorage === 'function') {
+			return app.loadLocalStorage(key);
 		}
+	} catch (_) {
+		/* private mode, quota, or an older app — treat as absent */
 	}
-	if (!id) id = newDeviceId();
-	if (!name) name = defaultDeviceName();
+	return null;
+}
+
+function writeLocal(app, key, value) {
+	try {
+		if (app && typeof app.saveLocalStorage === 'function') {
+			app.saveLocalStorage(key, value);
+		}
+	} catch (_) {
+		/* best effort; a lost preference is not worth breaking a scan over */
+	}
+}
+
+/**
+ * This device's identity.
+ *
+ * Stored per device on purpose: settings live in the vault and therefore sync,
+ * so an id kept there would hand every device the same identity and the
+ * Devices panel could never tell them apart.
+ */
+function loadDeviceIdentity(app) {
+	let id = readLocal(app, 'jemzsync-device-id');
+	if (!id) {
+		id = newDeviceId();
+		writeLocal(app, 'jemzsync-device-id', id);
+	}
+	const name = readLocal(app, 'jemzsync-device-name') || defaultDeviceName();
 	return { id: id, name: name, platform: defaultDeviceName() };
 }
 
 /*
- * The "don't warn me again" flag lives in localStorage for the same reason the
- * device id does: plugin settings are stored inside the vault and therefore
- * sync. Dismissing the warning on a correctly configured Mac must not silence
- * it on the iPhone that is still misconfigured.
+ * The "don't warn me again" flag is per device for the same reason: dismissing
+ * the setup warning on a correctly configured Mac must not silence it on an
+ * iPhone that is still misconfigured.
  */
-function loadDismissedWarning() {
-	try {
-		if (typeof localStorage === 'undefined') return null;
-		return localStorage.getItem('jemzsync-dismissed-location');
-	} catch (_) {
-		return null;
-	}
+function loadDismissedWarning(app) {
+	return readLocal(app, 'jemzsync-dismissed-location');
 }
 
-function saveDismissedWarning(code) {
-	try {
-		if (typeof localStorage !== 'undefined') {
-			localStorage.setItem('jemzsync-dismissed-location', code);
-		}
-	} catch (_) {
-		/* best effort */
-	}
+function saveDismissedWarning(app, code) {
+	writeLocal(app, 'jemzsync-dismissed-location', code);
 }
 
-function saveDeviceName(name) {
+function saveDeviceName(app, name) {
+	writeLocal(app, 'jemzsync-device-name', name);
+}
+
+/**
+ * Put text on the clipboard.
+ *
+ * The single place this plugin touches the clipboard, and it only ever writes.
+ * jemzsync never reads it, so nothing you copied from elsewhere is visible
+ * here. Every caller is a button or command the user pressed, and what goes
+ * across is either a sixteen-character digest or a block of shell commands.
+ *
+ * Writing can be refused — an unfocused window is enough — so failure falls
+ * back to telling the user rather than throwing into a click handler.
+ */
+async function copyToClipboard(text, message) {
 	try {
-		if (typeof localStorage !== 'undefined') {
-			localStorage.setItem('jemzsync-device-name', name);
-		}
+		await navigator.clipboard.writeText(text);
+		new Notice(message);
 	} catch (_) {
-		/* best effort */
+		new Notice('Could not reach the clipboard. Select the text and copy it by hand.');
 	}
 }
 
@@ -1345,7 +1365,7 @@ class JemzSyncPlugin extends Plugin {
 	async onload() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 		this.lastScan = null;
-		this.identity = loadDeviceIdentity();
+		this.identity = loadDeviceIdentity(this.app);
 		this.ecosystem = currentEcosystem();
 		this.liveTimer = null;
 
@@ -1397,8 +1417,10 @@ class JemzSyncPlugin extends Plugin {
 			name: 'Copy vault fingerprint',
 			callback: async () => {
 				const scan = this.lastScan || (await this.runScan(false));
-				await navigator.clipboard.writeText(scan.fingerprint.digest);
-				new Notice('Fingerprint copied. Paste it on your other device.');
+				await copyToClipboard(
+					scan.fingerprint.digest,
+					'Fingerprint copied. Paste it on your other device.'
+				);
 			},
 		});
 
@@ -1455,7 +1477,7 @@ class JemzSyncPlugin extends Plugin {
 	 */
 	maybeWarnAboutLocation(scan) {
 		if (!this.settings.warnOnBadLocation) return;
-		if (!shouldWarnAboutLocation(scan.location, loadDismissedWarning())) return;
+		if (!shouldWarnAboutLocation(scan.location, loadDismissedWarning(this.app))) return;
 		if (this.setupModalOpen) return;
 		try {
 			this.setupModalOpen = true;
@@ -1741,14 +1763,13 @@ class SetupModal extends Modal {
 		if (plan.shell && currentPlatform() === 'desktop') {
 			const copyBtn = row.createEl('button', { text: 'Copy commands' });
 			copyBtn.addEventListener('click', async () => {
-				await navigator.clipboard.writeText(plan.shell);
-				new Notice('Commands copied.');
+				await copyToClipboard(plan.shell, 'Commands copied.');
 			});
 		}
 
 		const hideBtn = row.createEl('button', { text: "Don't warn me again" });
 		hideBtn.addEventListener('click', () => {
-			saveDismissedWarning(this.location.code);
+			saveDismissedWarning(this.app, this.location.code);
 			this.close();
 		});
 	}
@@ -1920,8 +1941,10 @@ class JemzSyncView extends ItemView {
 				pre.createEl('code', { text: plan.shell });
 				const copy = card.createEl('button', { text: 'Copy commands' });
 				copy.addEventListener('click', async () => {
-					await navigator.clipboard.writeText(plan.shell);
-					new Notice('Commands copied. Paste them into your terminal.');
+					await copyToClipboard(
+						plan.shell,
+						'Commands copied. Paste them into your terminal.'
+					);
 				});
 			}
 		}
@@ -1950,8 +1973,7 @@ class JemzSyncView extends ItemView {
 		const row = card.createDiv({ cls: 'jemzsync-actions' });
 		const copyBtn = row.createEl('button', { text: 'Copy' });
 		copyBtn.addEventListener('click', async () => {
-			await navigator.clipboard.writeText(fp.digest);
-			new Notice('Fingerprint copied.');
+			await copyToClipboard(fp.digest, 'Fingerprint copied.');
 		});
 
 		const saved = this.plugin.settings.pairedFingerprint;
@@ -2066,7 +2088,7 @@ class JemzSyncSettingTab extends PluginSettingTab {
 					.onChange((v) => {
 						const name = v.trim() || defaultDeviceName();
 						this.plugin.identity.name = name;
-						saveDeviceName(name);
+						saveDeviceName(this.plugin.app, name);
 						this.plugin.refreshViews();
 					})
 			);
@@ -2193,5 +2215,16 @@ class JemzSyncSettingTab extends PluginSettingTab {
 module.exports = JemzSyncPlugin;
 module.exports.default = JemzSyncPlugin;
 module.exports.__core = CORE;
+/*
+ * Per-device state, exposed for tests. These reach storage only through the
+ * `app` handed to them, so a fake app exercises them the same way the fake
+ * adapter exercises the scanner.
+ */
+module.exports.__device = {
+	loadDeviceIdentity: loadDeviceIdentity,
+	saveDeviceName: saveDeviceName,
+	loadDismissedWarning: loadDismissedWarning,
+	saveDismissedWarning: saveDismissedWarning,
+};
 module.exports.VIEW_TYPE_JEMZSYNC = VIEW_TYPE_JEMZSYNC;
 module.exports.PLUGIN_ID = PLUGIN_ID;
