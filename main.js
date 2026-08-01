@@ -273,6 +273,27 @@ function classifyDriveLocation(basePath, ctx, ecosystem) {
 	const p = String(basePath).replace(/\\/g, '/').replace(/\/+$/, '');
 	const cloud = detectCloudFolder(p);
 
+	// Android reports a sandbox path that names no sync client either way, so an
+	// unrecognised path there is unknown rather than local. Desktop paths are
+	// trustworthy, so they still fall through to the local-only verdict below.
+	if (!cloud && ctx.platform === 'mobile') {
+		return {
+			code: 'mobile-unverifiable',
+			ok: false,
+			syncing: false,
+			title: 'Check the vault location yourself',
+			detail:
+				'Obsidian on ' +
+				eco.label +
+				' does not report a path jemzsync can judge. Confirm by hand that the vault is inside the folder your sync app watches, then compare fingerprints below.',
+			fixes: [
+				'Open your files app and find the folder holding "' + vaultName + '".',
+				'It has to sit inside the folder your sync app keeps up to date.',
+				'A vault in ordinary internal storage never leaves this device.',
+			],
+		};
+	}
+
 	if (cloud && cloud.id === 'gdrive') {
 		return {
 			code: 'ok',
@@ -314,6 +335,31 @@ function classifyDriveLocation(basePath, ctx, ecosystem) {
 	};
 }
 
+/**
+ * What we can honestly say on a device that will not tell us where the vault is.
+ *
+ * iOS and iPadOS hand back either nothing or a sandbox path with none of the
+ * markers a Mac path carries. Both cases mean "unknown", and unknown must not
+ * be reported as "local" — see the fallback at the end of classifyAppleLocation.
+ */
+function appleMobileUnverifiable(vaultName) {
+	return {
+		code: 'mobile-unverifiable',
+		ok: false,
+		syncing: false,
+		title: 'Check the vault location in the Files app',
+		detail:
+			'Obsidian on iOS and iPadOS does not expose the vault path, so jemzsync cannot read it. Verify it by hand, then use the fingerprint below to confirm the two devices match.',
+		fixes: [
+			'Open Files → Browse → iCloud Drive.',
+			'Confirm there is an Obsidian folder carrying the Obsidian icon, and that "' +
+				vaultName +
+				'" sits inside it.',
+			'A vault under "On My iPhone" is stored locally and will never sync.',
+		],
+	};
+}
+
 function classifyAppleLocation(basePath, ctx) {
 	ctx = ctx || {};
 	const platform = ctx.platform || 'unknown';
@@ -321,21 +367,7 @@ function classifyAppleLocation(basePath, ctx) {
 
 	if (!basePath) {
 		if (platform === 'mobile') {
-			return {
-				code: 'mobile-unverifiable',
-				ok: false,
-				syncing: false,
-				title: 'Check the vault location in the Files app',
-				detail:
-					'Obsidian on iOS and iPadOS does not expose the vault path, so jemzsync cannot read it. Verify it by hand, then use the fingerprint below to confirm the two devices match.',
-				fixes: [
-					'Open Files → Browse → iCloud Drive.',
-					'Confirm there is an Obsidian folder carrying the Obsidian icon, and that "' +
-						vaultName +
-						'" sits inside it.',
-					'A vault under "On My iPhone" is stored locally and will never sync.',
-				],
-			};
+			return appleMobileUnverifiable(vaultName);
 		}
 		return {
 			code: 'unknown',
@@ -415,6 +447,15 @@ function classifyAppleLocation(basePath, ctx) {
 				'Even with "Desktop & Documents Folders" enabled in iCloud settings, Obsidian on mobile will not find a vault here. It only reads its own container.',
 			fixes: ['Copy the vault into iCloud Drive → Obsidian.'],
 		};
+	}
+
+	// Everything above keys off markers that only appear in a Mac path. On iOS
+	// and iPadOS the adapter reports a sandbox path with none of them, so
+	// falling through here means "we could not tell", not "it is local". Saying
+	// local would tell someone whose iCloud vault is working perfectly to go and
+	// move it — the one piece of advice guaranteed to make things worse.
+	if (platform === 'mobile') {
+		return appleMobileUnverifiable(vaultName);
 	}
 
 	return {

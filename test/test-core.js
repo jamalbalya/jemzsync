@@ -1146,6 +1146,79 @@ async function ecosystemTests() {
 		assert.ok(r.fixes.join(' ').indexOf('Notes') !== -1);
 	});
 
+	group('mobile paths are never called local (regression, found on a real iPhone)');
+
+	await test('an iOS sandbox path is unverifiable, not local-only', () => {
+		// Obsidian on iOS hands back a path carrying none of the markers a Mac
+		// path has. Reading that as "local" told a working iCloud vault to move
+		// itself — which is exactly the advice that breaks a healthy setup.
+		const r = C.classifyVaultLocation(
+			'/private/var/mobile/Containers/Data/Application/ABC-123/Documents/Notes',
+			{ platform: 'mobile', vaultName: 'Notes' }
+		);
+		assert.strictEqual(r.code, 'mobile-unverifiable');
+		assert.notStrictEqual(r.code, 'local-only');
+	});
+
+	await test('a bare vault name from iOS is unverifiable too', () => {
+		const r = C.classifyVaultLocation('Notes', {
+			platform: 'mobile',
+			vaultName: 'Notes',
+		});
+		assert.strictEqual(r.code, 'mobile-unverifiable');
+	});
+
+	await test('and so it never triggers the setup popup', () => {
+		const r = C.classifyVaultLocation('/private/var/mobile/Containers/X/Notes', {
+			platform: 'mobile',
+			vaultName: 'Notes',
+		});
+		assert.strictEqual(C.shouldWarnAboutLocation(r, null), false);
+	});
+
+	await test('desktop still gets a straight local-only verdict', () => {
+		const r = C.classifyVaultLocation('/Users/j/Dev/notes', {
+			platform: 'desktop',
+			vaultName: 'notes',
+		});
+		assert.strictEqual(r.code, 'local-only');
+	});
+
+	await test('a real iOS iCloud path is still recognised as correct', () => {
+		const r = C.classifyVaultLocation(
+			'/private/var/mobile/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes',
+			{ platform: 'mobile', vaultName: 'Notes' }
+		);
+		assert.strictEqual(r.code, 'ok');
+		assert.strictEqual(r.ok, true);
+	});
+
+	await test('Android sandbox path is unverifiable, not local-only', () => {
+		const r = C.classifyVaultLocation(
+			'/storage/emulated/0/Android/data/md.obsidian/files/Notes',
+			{ platform: 'mobile', vaultName: 'Notes', ecosystem: 'android' }
+		);
+		assert.strictEqual(r.code, 'mobile-unverifiable');
+	});
+
+	await test('Android inside a Drive folder is still recognised as correct', () => {
+		const r = C.classifyVaultLocation('/storage/emulated/0/My Drive/Notes', {
+			platform: 'mobile',
+			vaultName: 'Notes',
+			ecosystem: 'android',
+		});
+		assert.strictEqual(r.code, 'ok');
+	});
+
+	await test('Windows desktop keeps its local-only verdict', () => {
+		const r = C.classifyVaultLocation('C:\\Users\\j\\Documents\\Notes', {
+			platform: 'desktop',
+			vaultName: 'Notes',
+			ecosystem: 'windows',
+		});
+		assert.strictEqual(r.code, 'local-only');
+	});
+
 	group('buildMigrationPlan across ecosystems');
 
 	await test('Windows gets PowerShell that backs up and never deletes', () => {
