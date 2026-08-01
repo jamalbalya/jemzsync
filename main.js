@@ -202,6 +202,12 @@ function ecosystemInfo(id) {
  * table rather than one regex.
  */
 const CLOUD_FOLDER_PATTERNS = [
+	// iCloud first: on Windows it is a real sync folder, but one Obsidian warns
+	// about, so it needs its own verdict rather than being lumped in with the
+	// providers that are simply fine.
+	{ id: 'icloud', label: 'iCloud Drive', re: /(^|\/)iCloud ?Drive(\/|$)/i },
+	{ id: 'icloud', label: 'iCloud Drive', re: /(^|\/)Mobile Documents(\/|$)/i },
+	{ id: 'icloud', label: 'iCloud Drive', re: /(^|\/)iCloud~[^/]*(\/|$)/i },
 	{ id: 'gdrive', label: 'Google Drive', re: /(^|\/)My Drive(\/|$)/i },
 	{ id: 'gdrive', label: 'Google Drive', re: /(^|\/)GoogleDrive-[^/]*(\/|$)/i },
 	{ id: 'gdrive', label: 'Google Drive', re: /(^|\/)Google ?Drive(\/|$)/i },
@@ -290,6 +296,27 @@ function classifyDriveLocation(basePath, ctx, ecosystem) {
 				'Open your files app and find the folder holding "' + vaultName + '".',
 				'It has to sit inside the folder your sync app keeps up to date.',
 				'A vault in ordinary internal storage never leaves this device.',
+			],
+		};
+	}
+
+	// iCloud does replicate this folder, so calling it "not syncing" would be a
+	// lie. But Obsidian's own documentation warns that iCloud Drive on Windows
+	// can duplicate or corrupt files, so calling it "fine" would be worse.
+	if (cloud && cloud.id === 'icloud') {
+		return {
+			code: 'icloud-outside-apple',
+			ok: false,
+			syncing: true,
+			title: 'Vault is on iCloud Drive, which is risky on ' + eco.label,
+			detail:
+				'iCloud is replicating this folder, so your notes do travel. Obsidian documents that iCloud Drive on Windows can duplicate or corrupt files, and no plugin can prevent that — jemzsync can only tell you when it has happened.',
+			fixes: [
+				'Safest: keep iCloud for your Apple devices and move this vault into ' +
+					eco.folderHint +
+					', then open the Drive copy from every non-Apple device.',
+				'Or use Obsidian Sync, which supports every platform directly.',
+				'If you stay on iCloud here, scan often — the conflicts card lists the duplicate copies it leaves behind.',
 			],
 		};
 	}

@@ -195,6 +195,8 @@ jemzsync reads Obsidian's platform flags on load and picks the cloud that ecosys
 
 OneDrive and Dropbox are recognised too. If your vault is already inside one of those, jemzsync reports it as fine rather than nagging you to move it — they replicate a folder just as well as Google Drive does.
 
+**iCloud Drive on Windows is a special case.** iCloud for Windows exists, and it does replicate the folder, so your notes genuinely travel between an iPad and a PC. But Obsidian's own documentation warns that iCloud Drive on Windows can duplicate or corrupt files, and no plugin can prevent that. jemzsync therefore reports it as *syncing but risky* rather than pretending it is either fine or broken — and the conflicts card is where the damage shows up when it happens. If you need a PC in the mix, Google Drive or Obsidian Sync is the safer foundation.
+
 **The Android caveat.** Google Drive is not the equivalent of iCloud here. The Drive app does not expose a folder that Obsidian can read and write continuously, so putting the vault "in Google Drive" on Android does not work the way it does on Windows. The workable options are a folder-sync app (FolderSync, Autosync for Google Drive) pointed at the Drive folder, or Obsidian Sync. jemzsync says so directly rather than sending you in a circle.
 
 ---

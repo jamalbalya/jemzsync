@@ -1219,6 +1219,69 @@ async function ecosystemTests() {
 		assert.strictEqual(r.code, 'local-only');
 	});
 
+	group('iCloud outside the Apple ecosystem');
+
+	await test('Windows + iCloud Drive is syncing, not local-only', () => {
+		// It really does replicate, so "local-only" would be a false alarm that
+		// sends someone to move a vault that is already travelling.
+		const r = C.classifyVaultLocation('C:\\Users\\j\\iCloudDrive\\Obsidian\\N', {
+			platform: 'desktop',
+			vaultName: 'N',
+			ecosystem: 'windows',
+		});
+		assert.strictEqual(r.code, 'icloud-outside-apple');
+		assert.strictEqual(r.syncing, true);
+		assert.notStrictEqual(r.code, 'local-only');
+	});
+
+	await test('but it is still flagged, because Obsidian warns against it', () => {
+		const r = C.classifyVaultLocation('C:\\Users\\j\\iCloud Drive\\N', {
+			platform: 'desktop',
+			vaultName: 'N',
+			ecosystem: 'windows',
+		});
+		assert.strictEqual(r.ok, false);
+		assert.ok(/duplicate|corrupt/i.test(r.detail));
+		assert.ok(r.fixes.length >= 1);
+	});
+
+	await test('the spaced and unspaced folder names both match', () => {
+		for (const p of ['C:/Users/j/iCloudDrive/N', 'C:/Users/j/iCloud Drive/N']) {
+			assert.strictEqual(C.detectCloudFolder(p).id, 'icloud');
+		}
+	});
+
+	await test('a raw iCloud container path is recognised too', () => {
+		assert.strictEqual(
+			C.detectCloudFolder('/x/Library/Mobile Documents/iCloud~md~obsidian/Documents/N').id,
+			'icloud'
+		);
+	});
+
+	await test('iCloud is never confused with Google Drive or OneDrive', () => {
+		assert.strictEqual(C.detectCloudFolder('C:/Users/j/iCloudDrive/N').id, 'icloud');
+		assert.strictEqual(C.detectCloudFolder('G:/My Drive/N').id, 'gdrive');
+		assert.strictEqual(C.detectCloudFolder('C:/Users/j/OneDrive/N').id, 'onedrive');
+	});
+
+	await test('on Apple the same container is simply correct, not flagged', () => {
+		const r = C.classifyVaultLocation(
+			'/Users/j/Library/Mobile Documents/iCloud~md~obsidian/Documents/N',
+			{ platform: 'desktop', vaultName: 'N', ecosystem: 'apple' }
+		);
+		assert.strictEqual(r.code, 'ok');
+		assert.strictEqual(r.ok, true);
+	});
+
+	await test('an iPad in the container is correct, same as a Mac', () => {
+		const r = C.classifyVaultLocation(
+			'/private/var/mobile/Library/Mobile Documents/iCloud~md~obsidian/Documents/N',
+			{ platform: 'mobile', vaultName: 'N', ecosystem: 'apple' }
+		);
+		assert.strictEqual(r.code, 'ok');
+		assert.strictEqual(r.ok, true);
+	});
+
 	group('buildMigrationPlan across ecosystems');
 
 	await test('Windows gets PowerShell that backs up and never deletes', () => {
