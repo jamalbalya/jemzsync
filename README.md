@@ -1,8 +1,10 @@
 # jemzsync
 
-Check that your Obsidian vault is set up to sync across your Apple devices, confirm the sync actually worked, and clean up the duplicate files iCloud leaves behind.
+Check that your Obsidian vault is set up to sync across your devices, confirm the sync actually worked, and clean up the duplicate files a sync engine leaves behind.
 
-Works on macOS, iPadOS and iOS.
+jemzsync works out which ecosystem it is running in and checks the vault against the right cloud: iCloud Drive on Apple devices, Google Drive on Windows and Android. While Obsidian is open it watches the vault and re-checks within seconds of anything changing — including files arriving from the other device.
+
+Works on macOS, iPadOS, iOS, Windows, Android and Linux.
 
 ---
 
@@ -18,12 +20,26 @@ What it does instead is fix the reason your notes are not showing up. Apple's sy
 
 | | Handled by |
 |---|---|
-| Moving file contents between devices | iCloud Drive |
-| Signing in to your Apple Account | The Settings app, once per device |
-| Checking the vault is in a folder iOS can actually open | **jemzsync** |
+| Moving file contents between devices | iCloud Drive / Google Drive |
+| Saving what you type into the vault | Obsidian, as you type |
+| Signing in to your Apple or Google Account | The Settings app, once per device |
+| Creating or switching vaults | You, in Obsidian's vault picker |
+| Working out which cloud this device should use | **jemzsync** |
+| Checking the vault is in a folder that cloud can reach | **jemzsync** |
+| Warning you up front when it is not | **jemzsync** |
+| Watching the vault and re-checking as things change | **jemzsync** |
 | Proving both devices hold the same notes | **jemzsync** |
-| Finding files iCloud has not downloaded yet | **jemzsync** |
+| Finding files the cloud has not downloaded yet | **jemzsync** |
 | Resolving duplicate copies after an offline edit | **jemzsync** |
+
+### Four things people ask for that no plugin can do
+
+These are worth stating plainly, because they sound reasonable and are not possible from inside Obsidian:
+
+- **Create the vault in iCloud or Google Drive for you.** A plugin runs *inside* a vault that is already open. It cannot create a vault elsewhere, cannot move the one it is in, and has no file access outside it. On Apple the iCloud container is worse than merely restricted — only Obsidian itself can register it, so a folder made by hand or by script never syncs.
+- **Log in to iCloud or Google Drive.** No entitlement, no OAuth, no network code at all.
+- **Run in the background when Obsidian is closed, or start itself after a reboot.** A plugin lives and dies with Obsidian. The good news is you do not need it to: iCloud Drive and Google Drive keep syncing on their own, as system services, whether Obsidian is open or not. To have Obsidian itself come back after a restart, add it to your login items.
+- **Sync faster than the cloud does.** Obsidian saves your notes into the vault folder as you type; the cloud client uploads from there. jemzsync's watcher makes the *checking* live, not the transport.
 
 ---
 
@@ -155,12 +171,41 @@ There is also a cloud icon in the left ribbon and a status bar summary.
 |---|---|---|
 | This device's name | Mac / iPhone / iPad | How the device introduces itself to the others. Stored per device, never synced |
 | Announce this device | On | Writes the small beacon file other devices read |
+| Watch the vault while Obsidian runs | On | Rescans a few seconds after anything changes, including files arriving from the cloud. Needs a restart |
+| Warn when the vault cannot sync | On | Popup on launch if the vault is somewhere the cloud cannot reach |
 | Scan when Obsidian starts | On | Checks the vault on launch |
 | Scan every | 15 minutes | Background scans. 0 means on demand only |
 | Notify about conflicts | On | Shows a notice when duplicates appear |
 | Show status bar item | On | One-line summary. Needs a restart |
 | Other device fingerprint | Empty | Paste from your other device to compare |
 | Other device name | Empty | A label so you remember which device |
+
+---
+
+## On Windows, Android and Linux
+
+jemzsync reads Obsidian's platform flags on load and picks the cloud that ecosystem can actually use. You do not configure this.
+
+| Device | Cloud checked for | Vault belongs in |
+|---|---|---|
+| Mac, iPhone, iPad | iCloud Drive | `iCloud Drive/Obsidian/YourVault` |
+| Windows | Google Drive | `My Drive\YourVault` (any drive letter) |
+| Android | Google Drive | see the caveat below |
+| Linux | Google Drive | whatever folder your client watches |
+
+OneDrive and Dropbox are recognised too. If your vault is already inside one of those, jemzsync reports it as fine rather than nagging you to move it — they replicate a folder just as well as Google Drive does.
+
+**The Android caveat.** Google Drive is not the equivalent of iCloud here. The Drive app does not expose a folder that Obsidian can read and write continuously, so putting the vault "in Google Drive" on Android does not work the way it does on Windows. The workable options are a folder-sync app (FolderSync, Autosync for Google Drive) pointed at the Drive folder, or Obsidian Sync. jemzsync says so directly rather than sending you in a circle.
+
+---
+
+## Watching the vault
+
+With **Watch the vault** on, jemzsync subscribes to Obsidian's vault events and rescans about eight seconds after the last change. That covers files you edit and files that arrive from your other device, so the panel and the fingerprint stay current without waiting for the 15-minute poll.
+
+The eight-second delay is deliberate: it collapses a burst of typing, or a batch of files landing from the cloud, into a single scan.
+
+One thing this must never do is react to its own beacon. Writing a beacon is a vault change, so an unfiltered watcher would scan, write a beacon, notice the write, and scan again — forever, on every device at once. Beacons are therefore excluded twice over, by path prefix and by an explicit beacon check, and both halves are asserted by tests and by a mutation that removes the guard.
 
 ---
 

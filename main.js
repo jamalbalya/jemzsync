@@ -87,6 +87,14 @@ const BEACON_MIN_INTERVAL_MS = 5 * 60 * 1000;
 /** A device silent for this long is shown as stale rather than out of sync. */
 const BEACON_STALE_MS = 48 * 60 * 60 * 1000;
 
+/**
+ * How long to wait after the last vault change before rescanning.
+ *
+ * Long enough that a burst of typing or a batch of files arriving from the
+ * cloud collapses into one scan, short enough that the panel still feels live.
+ */
+const LIVE_SCAN_DEBOUNCE_MS = 8 * 1000;
+
 /** The private iCloud container Obsidian owns. Mobile Obsidian only reads vaults from here. */
 const OBSIDIAN_CONTAINER = 'iCloud~md~obsidian';
 /** Generic iCloud Drive. A vault here syncs, but mobile Obsidian will not list it. */
@@ -97,6 +105,47 @@ const MOBILE_DOCUMENTS = 'Library/Mobile Documents';
 /** Shell-safe form of the folder mobile Obsidian reads from. */
 const CONTAINER_SHELL_PATH =
 	'$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents';
+
+/**
+ * Which cloud each ecosystem can actually keep a vault in.
+ *
+ * Apple is the strict one: mobile Obsidian reads a single private container,
+ * so there is exactly one correct folder. Everywhere else the vault just has
+ * to sit inside a folder that some desktop sync client is watching, which is
+ * a looser test — any of the three big providers will do.
+ */
+const ECOSYSTEMS = {
+	apple: {
+		id: 'apple',
+		label: 'Apple',
+		cloud: 'iCloud Drive',
+		folderHint: 'iCloud Drive → Obsidian',
+	},
+	windows: {
+		id: 'windows',
+		label: 'Windows',
+		cloud: 'Google Drive',
+		folderHint: 'Google Drive (usually G:) → My Drive → Obsidian',
+	},
+	android: {
+		id: 'android',
+		label: 'Android',
+		cloud: 'Google Drive',
+		folderHint: 'Google Drive → Obsidian',
+	},
+	linux: {
+		id: 'linux',
+		label: 'Linux',
+		cloud: 'Google Drive',
+		folderHint: 'your Google Drive folder → Obsidian',
+	},
+	unknown: {
+		id: 'unknown',
+		label: 'this device',
+		cloud: 'a sync folder',
+		folderHint: 'a folder your sync client watches',
+	},
+};
 
 const DEFAULT_SETTINGS = {
 	scanOnStartup: true,
@@ -109,6 +158,10 @@ const DEFAULT_SETTINGS = {
 	excludeNames: ['.DS_Store'],
 	/** Announce this device to the others by writing a small file in the vault. */
 	writeBeacon: true,
+	/** Rescan as soon as the vault changes, instead of waiting for the poll. */
+	watchVault: true,
+	/** Interrupt with a popup when the vault is somewhere that cannot sync. */
+	warnOnBadLocation: true,
 	/** Remembered so a second device can be compared without retyping. */
 	pairedFingerprint: '',
 	pairedDeviceLabel: '',
@@ -120,14 +173,148 @@ const DEFAULT_SETTINGS = {
  * ================================================================== */
 
 /**
- * Work out where a vault lives and whether iCloud can sync it to an iPhone.
+ * Turn Obsidian's platform flags into the one thing that decides where a vault
+ * has to live. Order matters: the mobile flags are checked first because a
+ * tablet can report a desktop-ish OS underneath.
+ *
+ * @param {{isIosApp?: boolean, isAndroidApp?: boolean, isMacOS?: boolean,
+ *          isWin?: boolean, isLinux?: boolean}} flags
+ * @returns {'apple'|'android'|'windows'|'linux'|'unknown'}
+ */
+function detectEcosystem(flags) {
+	flags = flags || {};
+	if (flags.isIosApp) return 'apple';
+	if (flags.isAndroidApp) return 'android';
+	if (flags.isMacOS) return 'apple';
+	if (flags.isWin) return 'windows';
+	if (flags.isLinux) return 'linux';
+	return 'unknown';
+}
+
+/** Description of an ecosystem, falling back to a neutral one. */
+function ecosystemInfo(id) {
+	return ECOSYSTEMS[id] || ECOSYSTEMS.unknown;
+}
+
+/*
+ * Folders the desktop sync clients actually create. Google Drive alone has
+ * three shapes depending on client version and OS, which is why this is a
+ * table rather than one regex.
+ */
+const CLOUD_FOLDER_PATTERNS = [
+	{ id: 'gdrive', label: 'Google Drive', re: /(^|\/)My Drive(\/|$)/i },
+	{ id: 'gdrive', label: 'Google Drive', re: /(^|\/)GoogleDrive-[^/]*(\/|$)/i },
+	{ id: 'gdrive', label: 'Google Drive', re: /(^|\/)Google ?Drive(\/|$)/i },
+	{ id: 'onedrive', label: 'OneDrive', re: /(^|\/)OneDrive([ -][^/]*)?(\/|$)/i },
+	{ id: 'dropbox', label: 'Dropbox', re: /(^|\/)Dropbox(\/|$)/i },
+];
+
+/** Which sync client, if any, is watching this path. Null when nothing is. */
+function detectCloudFolder(p) {
+	const s = String(p || '');
+	for (let i = 0; i < CLOUD_FOLDER_PATTERNS.length; i++) {
+		if (CLOUD_FOLDER_PATTERNS[i].re.test(s)) {
+			return {
+				id: CLOUD_FOLDER_PATTERNS[i].id,
+				label: CLOUD_FOLDER_PATTERNS[i].label,
+			};
+		}
+	}
+	return null;
+}
+
+/**
+ * Work out where a vault lives and whether it can reach this device's siblings.
+ *
+ * Apple gets its own routine because iOS reads exactly one private container;
+ * every other ecosystem only needs the vault to sit inside a watched folder.
  *
  * @param {string|null} basePath absolute vault path, or null when unavailable
- * @param {{platform?: string, vaultName?: string}} ctx
+ * @param {{platform?: string, vaultName?: string, ecosystem?: string}} ctx
  * @returns {{code: string, ok: boolean, syncing: boolean, title: string,
  *            detail: string, fixes: string[]}}
  */
 function classifyVaultLocation(basePath, ctx) {
+	ctx = ctx || {};
+	const ecosystem = ctx.ecosystem || 'apple';
+	if (ecosystem !== 'apple') {
+		return classifyDriveLocation(basePath, ctx, ecosystem);
+	}
+	return classifyAppleLocation(basePath, ctx);
+}
+
+/**
+ * Non-Apple ecosystems: the vault only has to be inside a folder some sync
+ * client is watching. Google Drive is the recommendation, but OneDrive and
+ * Dropbox work just as well and are not worth nagging about.
+ */
+function classifyDriveLocation(basePath, ctx, ecosystem) {
+	const eco = ecosystemInfo(ecosystem);
+	const vaultName = ctx.vaultName || 'YourVault';
+
+	if (!basePath) {
+		return {
+			code: 'mobile-unverifiable',
+			ok: false,
+			syncing: false,
+			title: 'Check the vault location yourself',
+			detail:
+				'Obsidian on ' +
+				eco.label +
+				' does not expose the vault path, so jemzsync cannot read it. Confirm it by hand, then use the fingerprint below to check the two devices match.',
+			fixes: [
+				'Open your files app and find the folder holding "' + vaultName + '".',
+				'It has to sit inside the folder your sync app keeps up to date.',
+				'A vault in ordinary internal storage never leaves this device.',
+			],
+		};
+	}
+
+	const p = String(basePath).replace(/\\/g, '/').replace(/\/+$/, '');
+	const cloud = detectCloudFolder(p);
+
+	if (cloud && cloud.id === 'gdrive') {
+		return {
+			code: 'ok',
+			ok: true,
+			syncing: true,
+			title: 'Vault is in the right place',
+			detail:
+				'This vault lives in your Google Drive folder, so every device signed in to the same Google Account can reach it.',
+			fixes: [],
+		};
+	}
+
+	if (cloud) {
+		return {
+			code: 'alternate-cloud',
+			ok: true,
+			syncing: true,
+			title: 'Vault is syncing through ' + cloud.label,
+			detail:
+				'That works. ' +
+				cloud.label +
+				' keeps this folder up to date the same way Google Drive would, so there is nothing to fix.',
+			fixes: [],
+		};
+	}
+
+	return {
+		code: 'local-only',
+		ok: false,
+		syncing: false,
+		title: 'Vault is stored locally and is not syncing',
+		detail:
+			'Nothing is replicating this folder, so changes stay on this device.',
+		fixes: [
+			'Install ' + eco.cloud + ' for desktop if you have not already.',
+			'Move the vault into ' + eco.folderHint + '.',
+			'Reopen it with "Open folder as vault" from the new location.',
+		],
+	};
+}
+
+function classifyAppleLocation(basePath, ctx) {
 	ctx = ctx || {};
 	const platform = ctx.platform || 'unknown';
 	const vaultName = ctx.vaultName || 'YourVault';
@@ -242,10 +429,88 @@ function classifyVaultLocation(basePath, ctx) {
 }
 
 /**
- * Terminal commands that move a vault into the folder mobile Obsidian reads.
- * A backup runs first and the original is never deleted.
+ * Commands that move a vault into the folder this ecosystem's devices can see.
+ * A backup always runs first and the original is never deleted.
+ *
+ * @param {string|null} basePath
+ * @param {string} vaultName
+ * @param {string} [ecosystem] defaults to Apple
  */
-function buildMigrationPlan(basePath, vaultName) {
+function buildMigrationPlan(basePath, vaultName, ecosystem) {
+	if (ecosystem && ecosystem !== 'apple') {
+		return buildDriveMigrationPlan(basePath, vaultName, ecosystem);
+	}
+	return buildAppleMigrationPlan(basePath, vaultName);
+}
+
+/**
+ * Google Drive ecosystems. Windows gets real PowerShell; Android gets prose,
+ * because there is no shell to paste into and — the part people trip over —
+ * the Google Drive app does not expose a folder Obsidian can write to. On
+ * Android the vault has to live in ordinary storage with a folder-sync app
+ * pointed at it.
+ */
+function buildDriveMigrationPlan(basePath, vaultName, ecosystem) {
+	const eco = ecosystemInfo(ecosystem);
+	const name = vaultName || 'MyVault';
+	const src = String(basePath || 'C:\\path\\to\\vault').replace(/[\\/]+$/, '');
+
+	if (ecosystem === 'android') {
+		return {
+			container: 'Google Drive',
+			target: 'Google Drive/' + name,
+			shell: '',
+			steps: [
+				'On your Windows or Mac machine, put the vault inside the Google Drive folder first.',
+				'On Android, Google Drive alone will not do — its app does not give Obsidian a folder it can write to.',
+				'Install a folder-sync app (FolderSync or Autosync for Google Drive) and point it at Drive → ' +
+					name +
+					'.',
+				'Open that local folder in Obsidian with "Open folder as vault".',
+				'If you would rather not run a second app, Obsidian Sync handles Android directly.',
+			],
+		};
+	}
+
+	if (ecosystem === 'windows') {
+		const target = '$env:USERPROFILE\\My Drive\\' + name;
+		const lines = [
+			'# 1. Back up first. Never skip this.',
+			'Copy-Item -Recurse "' +
+				src +
+				'" "$env:USERPROFILE\\Desktop\\' +
+				name +
+				'-backup"',
+			'',
+			'# 2. Copy the vault into your Google Drive folder.',
+			'#    Adjust the path if Drive is mounted on a letter such as G:.',
+			'Copy-Item -Recurse "' + src + '" "' + target + '"',
+		];
+		return {
+			container: '$env:USERPROFILE\\My Drive',
+			target: target,
+			shell: lines.join('\n'),
+			steps: [
+				'Run the commands below in PowerShell.',
+				'In Obsidian, choose "Open folder as vault" and pick ' + eco.folderHint + '.',
+				'Wait for Drive to finish uploading before editing on a second device.',
+				'Compare fingerprints in the jemzsync panel once the other device has synced.',
+			],
+		};
+	}
+
+	return {
+		container: eco.cloud,
+		target: eco.cloud + '/' + name,
+		shell: 'cp -R "' + src + '" "$HOME/' + eco.cloud.replace(/\s+/g, '') + '/' + name + '"',
+		steps: [
+			'Copy the vault into the folder your sync client watches.',
+			'Reopen it there with "Open folder as vault".',
+		],
+	};
+}
+
+function buildAppleMigrationPlan(basePath, vaultName) {
 	const name = vaultName || 'MyVault';
 	const src = String(basePath || '/path/to/vault').replace(/\/+$/, '');
 	const target = CONTAINER_SHELL_PATH + '/' + name;
@@ -276,6 +541,23 @@ function buildMigrationPlan(basePath, vaultName) {
 			'On the iPhone, open the same vault and compare fingerprints in the jemzsync panel.',
 		],
 	};
+}
+
+/**
+ * Should the setup popup interrupt the user?
+ *
+ * Only when there is something they can actually act on. A mobile vault whose
+ * path we cannot read is not a fault — nagging about it every launch would
+ * train people to dismiss the one warning that matters.
+ *
+ * `dismissedCode` is keyed by the specific problem, so moving a vault from
+ * "local-only" into the wrong iCloud folder warns again rather than staying
+ * silent on a stale dismissal.
+ */
+function shouldWarnAboutLocation(location, dismissedCode) {
+	if (!location || location.ok) return false;
+	if (location.code === 'mobile-unverifiable') return false;
+	return dismissedCode !== location.code;
 }
 
 /* ---------------------- placeholder files ---------------------- */
@@ -680,6 +962,40 @@ function summarizeScan(scan) {
 	return { level: 'ok', text: 'jemzsync: ' + scan.fingerprint.files + ' files synced' };
 }
 
+/* ---------------------- live watching ---------------------- *
+ *
+ * Watching the vault is what makes the panel react in seconds rather than on
+ * the next poll. It also introduces the one way this plugin could eat itself:
+ * writing a beacon is a vault change, so an unfiltered watcher would scan,
+ * write a beacon, see the write, scan again, forever — and the two devices
+ * would keep waking each other up over the cloud. This is the guard.
+ */
+
+/**
+ * Is this change worth a rescan?
+ *
+ * Beacons are rejected twice over: once by path prefix (they live under the
+ * excluded `.jemzsync/`) and once by `isBeaconPath`. Either check alone would
+ * do; keeping both means loosening one exclusion cannot silently reopen the
+ * feedback loop.
+ */
+function shouldRescanForChange(path, settings) {
+	settings = settings || DEFAULT_SETTINGS;
+	const p = String(path || '');
+	if (!p) return false;
+	if (isBeaconPath(p)) return false;
+
+	const parts = splitPath(p);
+	const names = settings.excludeNames || [];
+	if (names.indexOf(parts.base) !== -1) return false;
+
+	const prefixes = settings.excludePrefixes || [];
+	for (let i = 0; i < prefixes.length; i++) {
+		if (p.indexOf(prefixes[i]) === 0) return false;
+	}
+	return true;
+}
+
 const CORE = {
 	classifyVaultLocation: classifyVaultLocation,
 	buildMigrationPlan: buildMigrationPlan,
@@ -702,6 +1018,13 @@ const CORE = {
 	splitBeacons: splitBeacons,
 	shouldWriteBeacon: shouldWriteBeacon,
 	summarizeDevices: summarizeDevices,
+	detectEcosystem: detectEcosystem,
+	ecosystemInfo: ecosystemInfo,
+	detectCloudFolder: detectCloudFolder,
+	shouldWarnAboutLocation: shouldWarnAboutLocation,
+	shouldRescanForChange: shouldRescanForChange,
+	ECOSYSTEMS: ECOSYSTEMS,
+	LIVE_SCAN_DEBOUNCE_MS: LIVE_SCAN_DEBOUNCE_MS,
 	BEACON_DIR: BEACON_DIR,
 	BEACON_MIN_INTERVAL_MS: BEACON_MIN_INTERVAL_MS,
 	BEACON_STALE_MS: BEACON_STALE_MS,
@@ -834,6 +1157,7 @@ CORE.scanVault = scanVault;
 const Plugin = ob.Plugin;
 const PluginSettingTab = ob.PluginSettingTab;
 const ItemView = ob.ItemView;
+const Modal = ob.Modal;
 const Setting = ob.Setting;
 const Notice = ob.Notice;
 const Platform = ob.Platform;
@@ -842,6 +1166,11 @@ function currentPlatform() {
 	if (Platform && Platform.isMobileApp) return 'mobile';
 	if (Platform && Platform.isDesktopApp) return 'desktop';
 	return 'unknown';
+}
+
+/** Which cloud this install has to use, read off Obsidian's platform flags. */
+function currentEcosystem() {
+	return detectEcosystem(Platform || {});
 }
 
 /** A friendly default label for this device, refined per Apple device type. */
@@ -886,6 +1215,31 @@ function loadDeviceIdentity() {
 	return { id: id, name: name, platform: defaultDeviceName() };
 }
 
+/*
+ * The "don't warn me again" flag lives in localStorage for the same reason the
+ * device id does: plugin settings are stored inside the vault and therefore
+ * sync. Dismissing the warning on a correctly configured Mac must not silence
+ * it on the iPhone that is still misconfigured.
+ */
+function loadDismissedWarning() {
+	try {
+		if (typeof localStorage === 'undefined') return null;
+		return localStorage.getItem('jemzsync-dismissed-location');
+	} catch (_) {
+		return null;
+	}
+}
+
+function saveDismissedWarning(code) {
+	try {
+		if (typeof localStorage !== 'undefined') {
+			localStorage.setItem('jemzsync-dismissed-location', code);
+		}
+	} catch (_) {
+		/* best effort */
+	}
+}
+
 function saveDeviceName(name) {
 	try {
 		if (typeof localStorage !== 'undefined') {
@@ -924,6 +1278,8 @@ class JemzSyncPlugin extends Plugin {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 		this.lastScan = null;
 		this.identity = loadDeviceIdentity();
+		this.ecosystem = currentEcosystem();
+		this.liveTimer = null;
 
 		this.registerView(
 			VIEW_TYPE_JEMZSYNC,
@@ -993,10 +1349,57 @@ class JemzSyncPlugin extends Plugin {
 				}, this.settings.autoScanMinutes * 60 * 1000)
 			);
 		}
+
+		if (this.settings.watchVault) this.startWatching();
+	}
+
+	/**
+	 * React to vault changes as they happen, so the panel and the beacon reflect
+	 * reality within seconds instead of on the next poll. Files arriving from
+	 * the cloud fire these events too, which is what makes an incoming sync from
+	 * another device show up on its own.
+	 */
+	startWatching() {
+		const onChange = (file) => {
+			const path = file && (file.path || file);
+			if (!shouldRescanForChange(path, this.settings)) return;
+			this.scheduleLiveScan();
+		};
+		const vault = this.app.vault;
+		this.registerEvent(vault.on('create', onChange));
+		this.registerEvent(vault.on('modify', onChange));
+		this.registerEvent(vault.on('delete', onChange));
+		this.registerEvent(vault.on('rename', onChange));
+	}
+
+	/** Collapse a burst of changes into a single scan. */
+	scheduleLiveScan() {
+		if (this.liveTimer) window.clearTimeout(this.liveTimer);
+		this.liveTimer = window.setTimeout(() => {
+			this.liveTimer = null;
+			this.runScan(false).catch(() => {});
+		}, LIVE_SCAN_DEBOUNCE_MS);
+	}
+
+	/**
+	 * Tell the user once, up front, when the vault cannot possibly sync.
+	 * The dismissal is per device and per problem — see loadDismissedWarning.
+	 */
+	maybeWarnAboutLocation(scan) {
+		if (!this.settings.warnOnBadLocation) return;
+		if (!shouldWarnAboutLocation(scan.location, loadDismissedWarning())) return;
+		if (this.setupModalOpen) return;
+		try {
+			this.setupModalOpen = true;
+			new SetupModal(this.app, this, scan.location).open();
+		} catch (_) {
+			this.setupModalOpen = false;
+		}
 	}
 
 	onunload() {
-		/* Obsidian detaches leaves and intervals registered above. */
+		if (this.liveTimer) window.clearTimeout(this.liveTimer);
+		/* Obsidian detaches leaves, events and intervals registered above. */
 	}
 
 	async saveSettings() {
@@ -1017,12 +1420,16 @@ class JemzSyncPlugin extends Plugin {
 
 	async runScan(notify) {
 		const scan = await scanVault(this.app.vault.adapter, this.settings);
+		scan.ecosystem = this.ecosystem;
 		scan.location = classifyVaultLocation(vaultBasePath(this.app), {
 			platform: currentPlatform(),
 			vaultName: this.app.vault.getName(),
+			ecosystem: this.ecosystem,
 		});
 		await this.syncBeacons(scan);
 		this.lastScan = scan;
+
+		this.maybeWarnAboutLocation(scan);
 
 		const summary = summarizeScan(scan);
 		if (this.statusEl) this.statusEl.setText(summary.text);
@@ -1200,6 +1607,90 @@ class JemzSyncPlugin extends Plugin {
 	}
 }
 
+/* ---------------------- setup popup ---------------------- */
+
+/**
+ * Shown when the vault sits somewhere it cannot sync from. This is the one
+ * moment interrupting the user is worth it: until the vault moves, nothing
+ * else the plugin reports means anything.
+ */
+class SetupModal extends Modal {
+	constructor(app, plugin, location) {
+		super(app);
+		this.plugin = plugin;
+		this.location = location;
+	}
+
+	onOpen() {
+		const el = this.contentEl;
+		el.empty();
+		el.addClass('jemzsync-modal');
+
+		const eco = ecosystemInfo(this.plugin.ecosystem);
+
+		el.createEl('h2', { text: this.location.title });
+		el.createEl('p', {
+			cls: 'jemzsync-modal-detail',
+			text: this.location.detail,
+		});
+		el.createEl('p', {
+			cls: 'jemzsync-modal-detail',
+			text:
+				'This looks like ' +
+				eco.label +
+				', so your notes belong in ' +
+				eco.cloud +
+				'. Move the vault into ' +
+				eco.folderHint +
+				' — or create a new vault there and copy your notes across.',
+		});
+
+		if (this.location.fixes && this.location.fixes.length) {
+			const ol = el.createEl('ol', { cls: 'jemzsync-fixes' });
+			for (let i = 0; i < this.location.fixes.length; i++) {
+				ol.createEl('li', { text: this.location.fixes[i] });
+			}
+		}
+
+		const plan = buildMigrationPlan(
+			vaultBasePath(this.plugin.app),
+			this.plugin.app.vault.getName(),
+			this.plugin.ecosystem
+		);
+		if (plan.shell && currentPlatform() === 'desktop') {
+			const pre = el.createEl('pre', { cls: 'jemzsync-shell' });
+			pre.createEl('code', { text: plan.shell });
+		}
+
+		const row = el.createDiv({ cls: 'jemzsync-actions' });
+
+		const openBtn = row.createEl('button', { text: 'Show me in the panel' });
+		openBtn.addEventListener('click', () => {
+			this.close();
+			this.plugin.activateView();
+		});
+
+		if (plan.shell && currentPlatform() === 'desktop') {
+			const copyBtn = row.createEl('button', { text: 'Copy commands' });
+			copyBtn.addEventListener('click', async () => {
+				await navigator.clipboard.writeText(plan.shell);
+				new Notice('Commands copied.');
+			});
+		}
+
+		const hideBtn = row.createEl('button', { text: "Don't warn me again" });
+		hideBtn.addEventListener('click', () => {
+			saveDismissedWarning(this.location.code);
+			this.close();
+		});
+	}
+
+	onClose() {
+		this.plugin.setupModalOpen = false;
+		this.contentEl.empty();
+	}
+}
+
 /* ---------------------- sidebar view ---------------------- */
 
 class JemzSyncView extends ItemView {
@@ -1234,7 +1725,11 @@ class JemzSyncView extends ItemView {
 		header.createEl('div', {
 			cls: 'jemzsync-sub',
 			text:
-				'Last scan: ' + (scan ? timeAgo(scan.at) : 'never') + ' · iCloud Drive',
+				'Last scan: ' +
+				(scan ? timeAgo(scan.at) : 'never') +
+				' · ' +
+				ecosystemInfo(this.plugin.ecosystem).cloud +
+				(this.plugin.settings.watchVault ? ' · watching' : ''),
 		});
 
 		const actions = root.createDiv({ cls: 'jemzsync-actions' });
@@ -1347,14 +1842,20 @@ class JemzSyncView extends ItemView {
 
 		if (needsMigration) {
 			const basePath = vaultBasePath(this.plugin.app);
-			const plan = buildMigrationPlan(basePath, this.plugin.app.vault.getName());
-			const pre = card.createEl('pre', { cls: 'jemzsync-shell' });
-			pre.createEl('code', { text: plan.shell });
-			const copy = card.createEl('button', { text: 'Copy commands' });
-			copy.addEventListener('click', async () => {
-				await navigator.clipboard.writeText(plan.shell);
-				new Notice('Commands copied. Paste them into Terminal.');
-			});
+			const plan = buildMigrationPlan(
+				basePath,
+				this.plugin.app.vault.getName(),
+				this.plugin.ecosystem
+			);
+			if (plan.shell) {
+				const pre = card.createEl('pre', { cls: 'jemzsync-shell' });
+				pre.createEl('code', { text: plan.shell });
+				const copy = card.createEl('button', { text: 'Copy commands' });
+				copy.addEventListener('click', async () => {
+					await navigator.clipboard.writeText(plan.shell);
+					new Notice('Commands copied. Paste them into your terminal.');
+				});
+			}
 		}
 	}
 
@@ -1510,6 +2011,32 @@ class JemzSyncSettingTab extends PluginSettingTab {
 			.addToggle((t) =>
 				t.setValue(this.plugin.settings.writeBeacon).onChange(async (v) => {
 					this.plugin.settings.writeBeacon = v;
+					await this.plugin.saveSettings();
+				})
+			);
+
+		new Setting(containerEl)
+			.setName('Watch the vault while Obsidian runs')
+			.setDesc(
+				'Rescan a few seconds after anything changes, including files arriving from the cloud, instead of waiting for the next scheduled scan. Takes effect after Obsidian restarts.'
+			)
+			.addToggle((t) =>
+				t.setValue(this.plugin.settings.watchVault).onChange(async (v) => {
+					this.plugin.settings.watchVault = v;
+					await this.plugin.saveSettings();
+				})
+			);
+
+		new Setting(containerEl)
+			.setName('Warn when the vault cannot sync')
+			.setDesc(
+				'Show a popup if this vault is somewhere ' +
+					ecosystemInfo(this.plugin.ecosystem).cloud +
+					' cannot reach.'
+			)
+			.addToggle((t) =>
+				t.setValue(this.plugin.settings.warnOnBadLocation).onChange(async (v) => {
+					this.plugin.settings.warnOnBadLocation = v;
 					await this.plugin.saveSettings();
 				})
 			);

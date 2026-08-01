@@ -185,3 +185,31 @@
 	font-size: var(--font-ui-smaller);
 	margin-top: 2px;
 }
+
+/* --- setup popup --- */
+
+.jemzsync-modal h2 {
+	margin-top: 0;
+}
+
+.jemzsync-modal .jemzsync-modal-detail {
+	color: var(--text-muted);
+	line-height: 1.5;
+}
+
+.jemzsync-modal .jemzsync-fixes {
+	padding-left: 20px;
+	line-height: 1.6;
+}
+
+.jemzsync-modal .jemzsync-shell {
+	max-height: 220px;
+	overflow: auto;
+}
+
+.jemzsync-modal .jemzsync-actions {
+	margin-top: 16px;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+}

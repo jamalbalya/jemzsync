@@ -1,9 +1,9 @@
 {
 	"id": "jemzsync",
 	"name": "jemzsync",
-	"version": "1.1.0",
+	"version": "1.2.0",
 	"minAppVersion": "1.4.0",
-	"description": "Check that an iCloud vault is set up correctly for Apple devices, compare vaults across devices, and resolve sync conflicts.",
+	"description": "Detect your device's ecosystem, check the vault sits in a folder iCloud or Google Drive can sync, compare vaults across devices, and resolve sync conflicts.",
 	"author": "jamalbalya",
 	"authorUrl": "https://github.com/jamalbalya",
 	"isDesktopOnly": false

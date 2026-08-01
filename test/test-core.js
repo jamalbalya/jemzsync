@@ -1015,6 +1015,254 @@ async function moduleTests() {
 	});
 }
 
+/* ================= ecosystems ================= */
+
+async function ecosystemTests() {
+	group('detectEcosystem');
+
+	await test('each platform maps to its cloud', () => {
+		assert.strictEqual(C.detectEcosystem({ isIosApp: true }), 'apple');
+		assert.strictEqual(C.detectEcosystem({ isMacOS: true }), 'apple');
+		assert.strictEqual(C.detectEcosystem({ isAndroidApp: true }), 'android');
+		assert.strictEqual(C.detectEcosystem({ isWin: true }), 'windows');
+		assert.strictEqual(C.detectEcosystem({ isLinux: true }), 'linux');
+	});
+
+	await test('an unrecognised device is not guessed at', () => {
+		assert.strictEqual(C.detectEcosystem({}), 'unknown');
+		assert.strictEqual(C.detectEcosystem(null), 'unknown');
+	});
+
+	await test('iPad reporting a desktop OS underneath is still Apple', () => {
+		assert.strictEqual(
+			C.detectEcosystem({ isIosApp: true, isMacOS: true }),
+			'apple'
+		);
+	});
+
+	await test('Android wins over a desktop flag on the same device', () => {
+		assert.strictEqual(
+			C.detectEcosystem({ isAndroidApp: true, isLinux: true }),
+			'android'
+		);
+	});
+
+	group('detectCloudFolder');
+
+	await test('recognises every shape Google Drive mounts as', () => {
+		assert.strictEqual(C.detectCloudFolder('G:/My Drive/Notes').id, 'gdrive');
+		assert.strictEqual(
+			C.detectCloudFolder('C:/Users/j/Google Drive/Notes').id,
+			'gdrive'
+		);
+		assert.strictEqual(
+			C.detectCloudFolder(
+				'/Users/j/Library/CloudStorage/GoogleDrive-a@b.com/My Drive/Notes'
+			).id,
+			'gdrive'
+		);
+	});
+
+	await test('recognises OneDrive including the business suffix', () => {
+		assert.strictEqual(C.detectCloudFolder('C:/Users/j/OneDrive/N').id, 'onedrive');
+		assert.strictEqual(
+			C.detectCloudFolder('C:/Users/j/OneDrive - Acme/N').id,
+			'onedrive'
+		);
+	});
+
+	await test('recognises Dropbox', () => {
+		assert.strictEqual(C.detectCloudFolder('/home/j/Dropbox/N').id, 'dropbox');
+	});
+
+	await test('an ordinary folder matches nothing', () => {
+		assert.strictEqual(C.detectCloudFolder('C:/Users/j/Documents/Notes'), null);
+		assert.strictEqual(C.detectCloudFolder('/home/j/notes'), null);
+		assert.strictEqual(C.detectCloudFolder(''), null);
+	});
+
+	await test('a note merely named "dropbox" does not count as a sync folder', () => {
+		assert.strictEqual(C.detectCloudFolder('/home/j/notes/dropbox.md'), null);
+	});
+
+	group('classifyVaultLocation across ecosystems');
+
+	await test('omitting the ecosystem keeps the Apple behaviour', () => {
+		const withOut = C.classifyVaultLocation('/Users/j/Documents/N', {
+			platform: 'desktop',
+			vaultName: 'N',
+		});
+		const withApple = C.classifyVaultLocation('/Users/j/Documents/N', {
+			platform: 'desktop',
+			vaultName: 'N',
+			ecosystem: 'apple',
+		});
+		assert.strictEqual(withOut.code, 'desktop-documents');
+		assert.deepStrictEqual(withOut, withApple);
+	});
+
+	await test('a Windows vault in Google Drive is correct', () => {
+		const r = C.classifyVaultLocation('G:\\My Drive\\Notes', {
+			platform: 'desktop',
+			vaultName: 'Notes',
+			ecosystem: 'windows',
+		});
+		assert.strictEqual(r.code, 'ok');
+		assert.strictEqual(r.ok, true);
+		assert.strictEqual(r.syncing, true);
+	});
+
+	await test('a Windows vault outside any sync folder is flagged', () => {
+		const r = C.classifyVaultLocation('C:\\Users\\j\\Documents\\Notes', {
+			platform: 'desktop',
+			vaultName: 'Notes',
+			ecosystem: 'windows',
+		});
+		assert.strictEqual(r.code, 'local-only');
+		assert.strictEqual(r.ok, false);
+		assert.strictEqual(r.syncing, false);
+		assert.ok(r.fixes.join(' ').indexOf('Google Drive') !== -1);
+	});
+
+	await test('OneDrive is accepted rather than nagged about', () => {
+		const r = C.classifyVaultLocation('C:\\Users\\j\\OneDrive\\Notes', {
+			platform: 'desktop',
+			vaultName: 'Notes',
+			ecosystem: 'windows',
+		});
+		assert.strictEqual(r.code, 'alternate-cloud');
+		assert.strictEqual(r.ok, true);
+		assert.strictEqual(r.syncing, true);
+		assert.strictEqual(r.fixes.length, 0);
+	});
+
+	await test('Android without a path gives guidance, not an error', () => {
+		const r = C.classifyVaultLocation(null, {
+			platform: 'mobile',
+			vaultName: 'Notes',
+			ecosystem: 'android',
+		});
+		assert.strictEqual(r.code, 'mobile-unverifiable');
+		assert.ok(r.fixes.join(' ').indexOf('Notes') !== -1);
+	});
+
+	group('buildMigrationPlan across ecosystems');
+
+	await test('Windows gets PowerShell that backs up and never deletes', () => {
+		const plan = C.buildMigrationPlan('C:\\Users\\j\\Notes', 'Notes', 'windows');
+		assert.ok(plan.shell.indexOf('Copy-Item') !== -1);
+		assert.ok(/backup/i.test(plan.shell));
+		assert.strictEqual(/Remove-Item|rm -rf|del /i.test(plan.shell), false);
+	});
+
+	await test('Windows plan targets the Drive folder', () => {
+		const plan = C.buildMigrationPlan('C:\\Users\\j\\Notes', 'Notes', 'windows');
+		assert.ok(plan.target.indexOf('My Drive') !== -1);
+		assert.ok(plan.target.indexOf('Notes') !== -1);
+	});
+
+	await test('Android gets prose, and is honest that Drive alone will not do', () => {
+		const plan = C.buildMigrationPlan(null, 'Notes', 'android');
+		assert.strictEqual(plan.shell, '');
+		const text = plan.steps.join(' ');
+		assert.ok(/folder-sync|FolderSync|Autosync/i.test(text));
+		assert.ok(text.indexOf('will not') !== -1 || text.indexOf('not give') !== -1);
+	});
+
+	await test('omitting the ecosystem still produces the Apple plan', () => {
+		const plan = C.buildMigrationPlan('/Users/j/Notes', 'Notes');
+		assert.ok(plan.shell.indexOf('brctl download') !== -1);
+		assert.ok(plan.target.indexOf('iCloud~md~obsidian') !== -1);
+	});
+
+	group('shouldWarnAboutLocation');
+
+	await test('a healthy vault never interrupts', () => {
+		assert.strictEqual(C.shouldWarnAboutLocation({ ok: true, code: 'ok' }, null), false);
+		assert.strictEqual(C.shouldWarnAboutLocation(null, null), false);
+	});
+
+	await test('a vault that cannot sync does interrupt', () => {
+		assert.strictEqual(
+			C.shouldWarnAboutLocation({ ok: false, code: 'local-only' }, null),
+			true
+		);
+	});
+
+	await test('mobile-unverifiable is not a fault and must not nag', () => {
+		assert.strictEqual(
+			C.shouldWarnAboutLocation({ ok: false, code: 'mobile-unverifiable' }, null),
+			false
+		);
+	});
+
+	await test('dismissing silences that problem only', () => {
+		assert.strictEqual(
+			C.shouldWarnAboutLocation({ ok: false, code: 'local-only' }, 'local-only'),
+			false
+		);
+		// A different problem is a new problem, stale dismissal notwithstanding.
+		assert.strictEqual(
+			C.shouldWarnAboutLocation(
+				{ ok: false, code: 'wrong-icloud-folder' },
+				'local-only'
+			),
+			true
+		);
+	});
+
+	group('shouldRescanForChange');
+
+	await test('an ordinary note triggers a rescan', () => {
+		assert.strictEqual(C.shouldRescanForChange('Notes/Today.md', null), true);
+	});
+
+	await test('our own beacon never triggers a rescan (no feedback loop)', () => {
+		assert.strictEqual(
+			C.shouldRescanForChange('.jemzsync/device-abc123.json', null),
+			false
+		);
+	});
+
+	await test('the beacon guard holds even with every prefix exclusion removed', () => {
+		// isBeaconPath alone must be enough. If this ever fails, writing a beacon
+		// would schedule a scan, which writes a beacon: the plugin would spin.
+		assert.strictEqual(
+			C.shouldRescanForChange('.jemzsync/device-abc123.json', {
+				excludePrefixes: [],
+				excludeNames: [],
+			}),
+			false
+		);
+	});
+
+	await test('the prefix guard holds for non-beacon files under .jemzsync', () => {
+		// Deliberately redundant with isBeaconPath — this covers the other half.
+		assert.strictEqual(C.shouldRescanForChange('.jemzsync/notes.txt', null), false);
+	});
+
+	await test('per-device workspace churn does not trigger a rescan', () => {
+		assert.strictEqual(
+			C.shouldRescanForChange('.obsidian/workspace.json', null),
+			false
+		);
+	});
+
+	await test('.DS_Store does not trigger a rescan', () => {
+		assert.strictEqual(C.shouldRescanForChange('Notes/.DS_Store', null), false);
+	});
+
+	await test('an empty path is ignored rather than scanned', () => {
+		assert.strictEqual(C.shouldRescanForChange('', null), false);
+		assert.strictEqual(C.shouldRescanForChange(null, null), false);
+	});
+
+	await test('the debounce is long enough to collapse a burst', () => {
+		assert.ok(C.LIVE_SCAN_DEBOUNCE_MS >= 3000);
+		assert.ok(C.LIVE_SCAN_DEBOUNCE_MS <= 60000);
+	});
+}
+
 /* ================= runner ================= */
 
 (async function run() {
@@ -1029,6 +1277,7 @@ async function moduleTests() {
 	await scannerTests();
 	await beaconTests();
 	await scannerBeaconTests();
+	await ecosystemTests();
 	await moduleTests();
 
 	console.log('\n' + '-'.repeat(46));
