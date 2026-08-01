@@ -1,105 +1,120 @@
 # Publishing jemzsync to the Obsidian community plugins
 
-The whole path, from this repo to the in-app plugin browser. One important
-expectation up front: the final step is a pull request that the Obsidian team
-reviews by hand. Review commonly takes anywhere from days to several weeks,
-and they may request changes. Everything before that step is fully in your
-control.
+The path from this repo to the in-app plugin browser.
 
-## Step 1 — Push this repo to GitHub
+**The submission process changed in 2026.** You no longer fork
+`obsidianmd/obsidian-releases` and open a pull request against
+`community-plugins.json`. Submission now happens through a developer dashboard
+on the Community site, and review is automated: results usually arrive within
+minutes rather than weeks. Any guide telling you to open a PR is out of date.
 
-From the folder containing this project:
+## Step 0 — Make the repo public
 
-```bash
-git remote add origin https://github.com/jamalbalya/jemzsync.git
-git push -u origin main
-```
+Blocking. A private repo cannot be submitted; the reviewer reads the source.
 
-If the GitHub repo already has a commit (for example an auto-generated
-README) the push will be rejected. If there is nothing there you want to
-keep, force it:
+GitHub → the repo → **Settings** → **General** → **Danger Zone** →
+**Change repository visibility** → **Make public**.
 
-```bash
-git push -u origin main --force
-```
+## Step 1 — Confirm the layout
 
-## Step 2 — Confirm the layout GitHub shows
+The automated review checks these:
 
-The Obsidian submission bot checks these, so eyeball them once:
+- `manifest.json`, `README.md` and `LICENSE` are at the **repo root**, not in a
+  subfolder
+- The `id` in `manifest.json` is unique across the directory and does not
+  contain the word "obsidian" — check https://obsidian.md/plugins
+- No sample-plugin leftovers from `obsidian-sample-plugin`
 
-- `manifest.json` is at the **repo root** (not in a subfolder)
-- `README.md` and `LICENSE` are at the root
-- The `id` in manifest.json is `jemzsync` and appears nowhere else in the
-  community list (search https://obsidian.md/plugins to be sure)
+## Step 2 — Cut a release
 
-## Step 3 — Cut a release
-
-The release workflow in `.github/workflows/release.yml` does this for you:
+The workflow in `.github/workflows/release.yml` does this. Tag and push:
 
 ```bash
-git tag 1.1.0
-git push origin 1.1.0
+git tag 1.2.1
+git push origin 1.2.1
 ```
 
-That triggers a run which executes the test suite, verifies the tag equals
-the manifest version, and publishes a GitHub release with `main.js`,
-`manifest.json` and `styles.css` attached as individual assets.
+That runs the test suite, verifies the tag equals the manifest version, and
+publishes a release with `main.js`, `manifest.json` and `styles.css` attached
+as **individual assets**.
 
-Rules the tag must follow (Obsidian requirements):
+Two rules the tag must follow:
 
-- The tag is the bare version: `1.1.0`, **not** `v1.1.0`
-- It must exactly match `version` in `manifest.json`
+- Bare version, `1.2.1` — **not** `v1.2.1`
+- Exactly equal to `version` in `manifest.json`
 
-Check the release at https://github.com/jamalbalya/jemzsync/releases and
-confirm the three files are attached as assets (not just the source zip).
+Then open the Releases page and confirm the three files are attached
+separately. A source-code zip alone is not enough; Obsidian downloads the
+individual assets.
 
-## Step 4 — Test the released build yourself first
+## Step 3 — Use the released build yourself first
 
-Before submitting, install from your own release on at least your Mac and
-iPhone and use it for a few days. The reviewers will expect the released
-version to work, and you will catch anything the automated tests cannot see
-(UI layout, real iCloud timing).
+Install from your own release on a Mac and an iPhone and live with it for a
+few days. Automated review checks policy and code, not whether the thing
+actually works. The tests here cannot cover the Obsidian UI or real iCloud
+timing on real hardware — only you can.
 
-## Step 5 — Open the submission pull request
+## Step 4 — Submit through the developer dashboard
 
-1. Fork https://github.com/obsidianmd/obsidian-releases
-2. Edit `community-plugins.json` and add this entry **at the end** of the
-   list:
+1. Sign in at https://community.obsidian.md with your Obsidian account
+2. Connect the GitHub account that owns this repo, so ownership is verified
+3. **Plugins** → **New plugin**
+4. Enter the repository URL
+5. Read and agree to the developer policies and the support expectations
+6. Submit
 
-```json
-{
-  "id": "jemzsync",
-  "name": "jemzsync",
-  "author": "jamalbalya",
-  "description": "Check that an iCloud vault is set up correctly for Apple devices, compare vaults across devices, and resolve sync conflicts.",
-  "repo": "jamalbalya/jemzsync"
-}
-```
+Automated review runs immediately. Results typically appear within a few
+minutes. If it passes, the plugin becomes searchable and installable in the
+app within 24 hours.
 
-3. Open a pull request. The PR template has a checklist — tick it honestly.
-   A bot validates the entry within minutes and comments if something is
-   off (fix, push to your fork, and it re-checks automatically).
-4. Wait for human review. Respond to any requested changes by updating this
-   repo and cutting a new release; the PR picks up the latest release.
+If it fails, the dashboard says what to fix. Correct it here, then **cut a new
+release with an incremented version** — resubmission reads the latest release,
+so bumping the version is required, not optional.
 
-## Step 6 — After acceptance
+## Step 5 — Shipping updates afterwards
 
-Once merged, the plugin appears in **Settings → Community plugins → Browse**
-inside Obsidian for everyone. Future updates need no PR: bump the version in
-`manifest.json` and `versions.json`, tag, and push the tag — the workflow
-releases it and Obsidian's updater picks it up.
+No dashboard visit needed. Bump `manifest.json`, `versions.json` and
+`package.json` together, tag, push the tag. The workflow releases it and
+Obsidian's updater picks it up.
 
-## Requirements checklist (already satisfied by this repo)
+Note that automated review now scans **every version**, not just the first
+submission. A later release can be flagged even though the original passed.
 
-- [x] `manifest.json` at repo root, `id` matching the folder/plugin name
-- [x] `isDesktopOnly: false` and no Node.js/Electron APIs (verified by audit)
-- [x] Description under 250 characters, ends with a period, doesn't start
-      with "This is a plugin"
-- [x] README explaining what it does and how to use it
-- [x] LICENSE file (MIT)
-- [x] No network calls, no analytics, no credentials
-- [x] `versions.json` mapping plugin version → minimum app version
-- [x] Test suite (`npm test`) and mutation verification
-      (`npm run test:mutation`)
+## Requirements this repo already satisfies
 
-Reference: https://docs.obsidian.md/Plugins/Releasing/Submission+requirements+for+plugins
+- [x] `manifest.json` at root with every required field
+- [x] `id` (`jemzsync`) contains no "obsidian" and is unique
+- [x] Description is 156 characters, opens with an action verb, ends with a
+      period, no emoji, does not begin with "This is a plugin"
+- [x] `isDesktopOnly: false`, and genuinely no Node.js or Electron APIs —
+      the audit greps for `fs`, `path`, `os`, `child_process`, `electron`
+- [x] Command ids omit the plugin id, which Obsidian prefixes itself
+- [x] No `innerHTML`/`outerHTML`; the DOM is built with `createEl`
+- [x] Leaves are not detached in `onunload`
+- [x] `this.app` throughout; the global `app` is never touched
+- [x] Styling lives in `styles.css` against theme CSS variables, no hardcoded
+      colours
+- [x] No sample-plugin code
+- [x] `LICENSE` (MIT) at root
+- [x] README states plainly that there is no network use, no telemetry and no
+      credential handling — a policy disclosure requirement
+- [x] `versions.json` maps plugin version to minimum app version
+- [x] Tests (`npm test`) and mutation verification (`npm run test:mutation`)
+
+## Worth deciding before you submit
+
+**The plugin name is all lowercase.** `jemzsync` is valid, but the directory
+mostly uses title case and Obsidian's style guide asks for correct
+capitalisation. `Jemzsync` reads better next to the other entries. Changing
+`name` in `manifest.json` is safe at any time; changing `id` after acceptance
+is not, so leave the id alone.
+
+**`minAppVersion` is `1.4.0`.** Only lower it if you have actually tested that
+far back. Raising it later is fine.
+
+## References
+
+- Submit your plugin — https://docs.obsidian.md/Plugins/Releasing/Submit+your+plugin
+- Submission requirements — https://docs.obsidian.md/Plugins/Releasing/Submission+requirements+for+plugins
+- Developer policies — https://docs.obsidian.md/Developer+policies
+- Announcement of the new process — https://obsidian.md/blog/future-of-plugins/
