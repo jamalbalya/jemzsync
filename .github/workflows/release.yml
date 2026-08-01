@@ -1,0 +1,40 @@
+# Tag a version (e.g. `git tag 1.1.0 && git push origin 1.1.0`) and this
+# workflow runs the test suite, then publishes a GitHub release with the
+# three files Obsidian needs as assets.
+#
+# The tag must exactly equal the version in manifest.json, with no "v"
+# prefix — that is an Obsidian community-plugin requirement.
+name: Release
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run test suite
+        run: node test/test-core.js
+
+      - name: Verify tag matches manifest version
+        run: |
+          MANIFEST_VERSION=$(node -p "require('./manifest.json').version")
+          if [ "$GITHUB_REF_NAME" != "$MANIFEST_VERSION" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match manifest version $MANIFEST_VERSION"
+            exit 1
+          fi
+
+      - name: Create release with plugin assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            main.js
+            manifest.json
+            styles.css
