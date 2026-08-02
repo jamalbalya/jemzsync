@@ -14,7 +14,9 @@ Works on macOS, iPadOS, iOS, Windows, Android and Linux.
 
 An Obsidian plugin cannot sign in to an Apple Account, and jemzsync does not try. Reading or writing iCloud on your behalf requires a signed native app holding Apple's iCloud entitlement, granted only to apps built with a paid Apple Developer account. Plugins are JavaScript running inside Obsidian's sandbox: no entitlement, no Apple Account access, and on iPhone and iPad no access to any file outside the vault.
 
-So jemzsync never asks for your Apple Account, never sees your password, and sends nothing anywhere. It has no network code at all.
+So jemzsync never asks for your Apple Account and never sees your password.
+
+It does not contact iCloud or Google Drive either — it cannot. The **one** network destination it ever reaches is `api.github.com`, and only if you choose GitHub storage and connect an account yourself. Leave that switched off, as it is by default, and the plugin makes no network requests at all.
 
 What it does instead is fix the reason your notes are not showing up. Apple's sync already works — the usual problem is that the vault is in a folder your iPhone cannot see. jemzsync finds that, tells you exactly how to fix it, and then proves the fix worked.
 
@@ -37,7 +39,7 @@ What it does instead is fix the reason your notes are not showing up. Apple's sy
 These are worth stating plainly, because they sound reasonable and are not possible from inside Obsidian:
 
 - **Create the vault in iCloud or Google Drive for you.** A plugin runs *inside* a vault that is already open. It cannot create a vault elsewhere, cannot move the one it is in, and has no file access outside it. On Apple the iCloud container is worse than merely restricted — only Obsidian itself can register it, so a folder made by hand or by script never syncs.
-- **Log in to iCloud or Google Drive.** No entitlement, no OAuth, no network code at all.
+- **Log in to iCloud or Google Drive.** No entitlement, no OAuth, no API. GitHub is different — it has a public API a plugin may use, which is why GitHub storage is possible and iCloud storage is not.
 - **Run in the background when Obsidian is closed, or start itself after a reboot.** A plugin lives and dies with Obsidian. The good news is you do not need it to: iCloud Drive and Google Drive keep syncing on their own, as system services, whether Obsidian is open or not. To have Obsidian itself come back after a restart, add it to your login items.
 - **Sync faster than the cloud does.** Obsidian saves your notes into the vault folder as you type; the cloud client uploads from there. jemzsync's watcher makes the *checking* live, not the transport.
 
@@ -127,7 +129,11 @@ Each device writes one small file into a hidden `.jemzsync` folder inside the va
 
 Beacons are excluded from the fingerprint itself, so writing one never triggers a false mismatch, and are refreshed at most every 5 minutes so iCloud isn't churned. Turn announcing off in settings if you prefer.
 
-You can still compare by hand: **Copy vault fingerprint** on one device, paste into **Other device fingerprint** in settings on the other. Matching codes mean identical notes.
+**The comparison fields fill themselves in.** Once another device has announced itself, its name and fingerprint appear in **Other device fingerprint** and **Other device name** in settings on their own — there is nothing to copy across.
+
+Both fields stay editable. Type into one and it is yours: nothing will overwrite it, on any later scan. Clear it and jemzsync starts filling it in again. There is a **Detect again** button beside each if you want to hand both back at once.
+
+You can still do it by hand if you prefer: **Copy vault fingerprint** on one device, paste into **Other device fingerprint** on the other. Matching codes mean identical notes.
 
 If they do not match, jemzsync tells you which device has more files. Wait a few minutes for iCloud and scan again.
 
@@ -169,7 +175,7 @@ There is also a cloud icon in the left ribbon and a status bar summary.
 
 | Setting | Default | What it does |
 |---|---|---|
-| This device's name | Mac / iPhone / iPad | How the device introduces itself to the others. Stored per device, never synced |
+| This device's name | Detected (Mac, iPhone, Windows PC…) | How the device introduces itself to the others. A second device with the same name becomes "Mac 2" on its own. Stored per device, never synced |
 | Announce this device | On | Writes the small beacon file other devices read |
 | Watch the vault while Obsidian runs | On | Rescans a few seconds after anything changes, including files arriving from the cloud. Needs a restart |
 | Warn when the vault cannot sync | On | Popup on launch if the vault is somewhere the cloud cannot reach |
@@ -177,8 +183,57 @@ There is also a cloud icon in the left ribbon and a status bar summary.
 | Scan every | 15 minutes | Background scans. 0 means on demand only |
 | Notify about conflicts | On | Shows a notice when duplicates appear |
 | Show status bar item | On | One-line summary. Needs a restart |
-| Other device fingerprint | Empty | Paste from your other device to compare |
-| Other device name | Empty | A label so you remember which device |
+| Other device fingerprint | Detected | Filled in from the other device's announcement. Editable; clear it to re-enable detection |
+| Other device name | Detected | Filled in from the other device's announcement. Editable |
+
+---
+
+## Where your vault is stored
+
+Settings → jemzsync → **Where this vault is stored**. Three choices:
+
+| Choice | What carries your notes |
+|---|---|
+| **This device's cloud only** *(default)* | iCloud Drive on Apple, Google Drive elsewhere. GitHub is never contacted. |
+| **Cloud and GitHub** | The cloud moves your notes between devices; GitHub additionally keeps a full history you can go back through. |
+| **GitHub only** | GitHub moves your notes. The vault can sit anywhere on disk. |
+
+**GitHub only is the answer to a vault spanning ecosystems.** A Mac and a Windows PC have no good shared consumer cloud — iCloud on Windows can duplicate files, and Google Drive on Android needs a second app. A Git repository works identically on all of them.
+
+### Keeping in sync
+
+With GitHub storage on, jemzsync sends your changes about ten seconds after you stop typing, and checks for other devices' work every few minutes. Both are adjustable, and both can be switched off in favour of a **Sync now** button.
+
+Receiving is a poll, not a push, and it is worth being clear why: GitHub has no way to notify a plugin that something changed. Sending is immediate because that is the half that can lose work if the device goes away; receiving can wait a few minutes.
+
+### When two devices edit the same note
+
+Nothing is thrown away. The version from the other device is written alongside yours as `Note (github conflicted copy 2026-08-02).md`, and the conflicts card resolves it with the same **Keep newest** / **Merge both** buttons it uses for iCloud duplicates.
+
+Several rules worth stating plainly, because each one exists because the alternative lost a file during testing:
+
+- **An edit always beats a delete.** If you delete a note on one device while editing it on another, the edit survives. Losing writing is unrecoverable; an unexpectedly resurrected file is not.
+- **A file that cannot be read is never treated as deleted.** It is reported and left exactly as it is, on both sides.
+- **A file the cloud has offloaded is not a deleted file.** iCloud replaces contents with a `.icloud` stub whenever it wants disk space back; those are treated as present-but-unreadable, never as gone.
+- **Deletes are always recoverable.** They go to Obsidian's trash, and if Obsidian does not yet know about the file, into the vault's own `.trash` folder. Nothing is ever removed outright.
+- **The branch is never force-pushed.** If another device committed first, the push is refused and the two sides are merged instead.
+- **A stale answer from GitHub is refused.** If the branch has not moved since this device last pushed, the file list must still contain everything it put there; when it does not, syncing stops rather than acting on a partial view.
+- **A sync that would gut the repository is refused.** Removing more than half of it at once is never an ordinary edit.
+- **Anything destructive waits for you.** Adding files applies immediately; overwriting or deleting shows you exactly what would happen and waits. Automatic syncing never applies a destructive change unattended.
+
+### What gets sent
+
+Your notes and attachments, and by default the rest of `.obsidian/` — themes, snippets and other plugins — so a new device comes up already configured. Switch on **Notes only** to send just the markdown.
+
+Four things are never sent, whatever the setting: any plugin's `data.json` (they hold API keys), `.obsidian/workspace*` (per-device layout), the `.jemzsync` announcements, and jemzsync's own files. That last one is deliberate: Obsidian's developer policy forbids a plugin distributing or updating itself, so a device in GitHub-only mode needs jemzsync installed by hand.
+
+### Authentication: a token, not an SSH key
+
+jemzsync talks to GitHub's REST API, which authenticates with a **fine-grained personal access token** in an HTTP header. SSH keys are for the `git` command line, which speaks a different protocol over a raw TCP socket — something an Obsidian plugin has no access to on any platform, and could never have on iOS or Android.
+
+Create a token with **Contents: read and write** on the one repository you want to use, and paste it in. The field is masked, with an eye to reveal it.
+
+The token is stored through `app.saveLocalStorage` — on that device, never in the vault. This matters more than it sounds: `saveData` writes into the vault, and the vault is both replicated by iCloud *and* committed to the repository. A token kept there would be copied to every device and then published into the repo it unlocks.
 
 ---
 
@@ -229,7 +284,11 @@ One thing this must never do is react to its own beacon. Writing a beacon is a v
 
 ## Privacy
 
-- No network requests. There is no networking code in this plugin.
+- **Network use: `api.github.com`, and nothing else.** Only when you turn on GitHub storage and connect an account. No analytics, no telemetry, no other host, ever. With GitHub off, the plugin makes no requests.
+- **An account is required only for GitHub storage.** Everything else works with no account of any kind.
+- **Your access token stays on the device you entered it on.** It is written through `app.saveLocalStorage`, never through `saveData` — because `saveData` writes into the vault, and the vault is replicated by iCloud *and* committed to the repository. A token kept there would be copied to every device and then published into the repo it unlocks. It is shown masked and never logged.
+- **What gets sent:** the vault files you chose to sync, as Git commits to the repository you picked. Nothing else leaves the device.
+- **What is never sent, whatever your settings:** `.obsidian/plugins/*/data.json` — other plugins keep API keys there, and a commit cannot be taken back — plus `.obsidian/workspace*`, `.jemzsync/`, `.trash/`, `.git/` and `.DS_Store`. The list is asserted rule by rule in the tests, so dropping one is caught.
 - No Apple Account, password, email or credential is requested, stored or transmitted.
 - Nothing leaves your device. Scan results live in memory; only your own settings are saved, into your vault.
 - The only things written to your vault are conflict resolutions you explicitly ask for, and (if announcing is on) one small JSON file per device under `.jemzsync/` containing a device name you chose, a random ID, and file counts — never note contents, never an email or account.
@@ -245,7 +304,9 @@ Obsidian's automated review flags both of these. Neither is accidental.
 - **The device ID.** Every device needs a different one. Stored through `saveData`, the first device's ID would sync to the second, both would claim the same identity, and the Devices panel could never tell them apart.
 - **The "don't warn me again" dismissal.** Dismissing the setup warning on a correctly configured Mac must not silence it on an iPhone that is still misconfigured.
 
-Both go through `app.saveLocalStorage` / `app.loadLocalStorage`, Obsidian's own API for exactly this: stored on the device, never synced, and scoped per vault — so two vaults open on the same Mac get separate identities rather than quietly sharing one. Everything that *should* be shared — scan preferences, exclusions, the paired fingerprint — goes through `saveData` as normal.
+Both go through `app.saveLocalStorage` / `app.loadLocalStorage`, Obsidian's own API for exactly this: stored on the device, never synced, and scoped per vault — so two vaults open on the same Mac get separate identities rather than quietly sharing one. Everything that *should* be shared — scan preferences, exclusions — goes through `saveData` as normal.
+
+- **The paired device's fingerprint and name.** These moved out of `saveData` in 1.4.0, when they started filling themselves in. "The other device" is a different device depending on which one you are standing at, so a single shared value cannot be right for both. Worse, it could never settle: the Mac would write the iPhone's digest into the shared file, iCloud would carry it to the iPhone, which would overwrite it with the Mac's — and because that file lives in the vault, every one of those writes changed the fingerprint the two devices were trying to match on.
 
 Nine tests drive this against a fake app, including that two vaults never collide, that a dismissal in one does not silence another, and that a build without the storage API degrades to an ephemeral ID instead of throwing.
 
@@ -259,9 +320,9 @@ cd jemzsync
 npm test
 ```
 
-99 tests, no dependencies, no build step. The suite covers vault-location detection, the migration plan, conflict grouping and resolution, fingerprinting, device beacons, and the scanner driven by a fake adapter — including end-to-end simulations of a Mac beacon being read on an iPhone for both the matching and the missing-note case.
+325 tests, no dependencies, no build step. The suite covers vault-location detection, the migration plan, conflict grouping and resolution, fingerprinting, device beacons, pairing auto-fill, device naming, ecosystem-neutral wording, and the scanner driven by a fake adapter — including end-to-end simulations of a Mac beacon being read on an iPhone for both the matching and the missing-note case.
 
-The suite is itself verified by mutation testing (`npm run test:mutation`): 20 deliberate regressions are injected into a temporary copy of the source and all 20 must be caught, including an infinite-loop hang.
+The suite is itself verified by mutation testing (`npm run test:mutation`): 76 deliberate regressions are injected into a temporary copy of the source and all 76 must be caught — including an infinite-loop hang, an auto-filled field overwriting something you typed, Apple wording creeping back into a screen every platform sees, a force-push that would erase another device, an offloaded file being mistaken for a deleted one, and a delete falling back to a permanent removal instead of the trash.
 
 Layout:
 

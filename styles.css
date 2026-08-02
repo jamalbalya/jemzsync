@@ -213,3 +213,24 @@
 	flex-wrap: wrap;
 	gap: 8px;
 }
+
+/* GitHub repository picker */
+.jemzsync-repo-list {
+	max-height: 22em;
+	overflow-y: auto;
+	margin: 0.75em 0;
+}
+
+.jemzsync-repo {
+	padding: 0.6em 0;
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.jemzsync-repo-name {
+	font-weight: 600;
+	color: var(--text-normal);
+}
+
+.jemzsync-repo button {
+	margin-top: 0.4em;
+}

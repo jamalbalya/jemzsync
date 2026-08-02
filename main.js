@@ -79,6 +79,64 @@ const ob = safeRequire('obsidian') || headlessStubs();
 const VIEW_TYPE_JEMZSYNC = 'jemzsync-status';
 const PLUGIN_ID = 'jemzsync';
 
+/**
+ * Where the vault is kept, and therefore what "set up correctly" means.
+ *
+ * The choice is per device, because each one has to know how it stores this
+ * vault before it can read anything — in GitHub mode there is no synced
+ * settings file to learn the answer from until after the first pull.
+ */
+const STORAGE_ECOSYSTEM = 'ecosystem';
+const STORAGE_GITHUB = 'github';
+const STORAGE_BOTH = 'both';
+
+const STORAGE_MODES = [
+	{
+		id: STORAGE_ECOSYSTEM,
+		/**
+		 * Built from the ecosystem rather than patched with a string replace.
+		 * The old version swapped the word "cloud" into a fixed sentence,
+		 * which only produced the right text by accident of capitalisation.
+		 */
+		label: (eco) => "This device's " + eco.cloud + ' only',
+		blurb: (eco) => eco.cloud + ' carries the vault, as it does today. GitHub is not used.',
+	},
+	{
+		id: STORAGE_BOTH,
+		label: () => 'Cloud and GitHub',
+		blurb: (eco) =>
+			eco.cloud +
+			' carries the vault between devices, and GitHub additionally keeps a full history you can go back through.',
+	},
+	{
+		id: STORAGE_GITHUB,
+		label: () => 'GitHub only',
+		blurb: () =>
+			'GitHub carries the vault between devices. The vault can sit anywhere on disk. This is the option that works when your devices are in different ecosystems.',
+	},
+];
+
+/** True when this mode talks to a repository at all. */
+function storageUsesGithub(mode) {
+	return mode === STORAGE_GITHUB || mode === STORAGE_BOTH;
+}
+
+/** True when the ecosystem's cloud is still expected to carry the vault. */
+function storageUsesCloud(mode) {
+	return mode !== STORAGE_GITHUB;
+}
+
+/**
+ * Where this plugin's own files sit inside the vault.
+ *
+ * They must never count toward the vault fingerprint. Updating the plugin
+ * changes the size of main.js, so a device on the new version and one still on
+ * the old would compare their vaults and conclude they were out of sync — the
+ * plugin reporting a sync failure that is nothing but its own upgrade. This is
+ * the same self-reference problem as the beacons, and gets the same answer.
+ */
+const SELF_DIR = '.obsidian/plugins/jemzsync/';
+
 /** Hidden folder inside the vault where each device announces itself. */
 const BEACON_DIR = '.jemzsync';
 const BEACON_PREFIX = '.jemzsync/device-';
@@ -94,6 +152,16 @@ const BEACON_STALE_MS = 48 * 60 * 60 * 1000;
  * cloud collapses into one scan, short enough that the panel still feels live.
  */
 const LIVE_SCAN_DEBOUNCE_MS = 8 * 1000;
+
+/**
+ * How long after the last edit to send changes to GitHub.
+ *
+ * Shorter than the scan debounce: a scan is cheap and local, whereas an
+ * unsent edit is the half of the round trip that can actually lose work if
+ * the device goes away. Still long enough that typing a paragraph is one
+ * commit rather than forty.
+ */
+const GITHUB_SYNC_DEBOUNCE_MS = 10 * 1000;
 
 /** The private iCloud container Obsidian owns. Mobile Obsidian only reads vaults from here. */
 const OBSIDIAN_CONTAINER = 'iCloud~md~obsidian';
@@ -113,6 +181,11 @@ const CONTAINER_SHELL_PATH =
  * so there is exactly one correct folder. Everywhere else the vault just has
  * to sit inside a folder that some desktop sync client is watching, which is
  * a looser test — any of the three big providers will do.
+ *
+ * The last three fields exist so that no message shown to every user has to
+ * hardcode Apple's vocabulary. A Windows user was previously told to look in
+ * Finder and to compare against "your iPhone or iPad"; anything user-facing
+ * outside the Apple-only branches now reads its nouns from here instead.
  */
 const ECOSYSTEMS = {
 	apple: {
@@ -120,30 +193,48 @@ const ECOSYSTEMS = {
 		label: 'Apple',
 		cloud: 'iCloud Drive',
 		folderHint: 'iCloud Drive → Obsidian',
+		/** What the OS calls its file browser. */
+		fileManager: 'Finder',
+		/** Mid-sentence description of the user's other device. */
+		otherDevice: 'iPhone or iPad',
+		/** Short enough to sit in a text-field placeholder. */
+		deviceExample: 'iPhone',
 	},
 	windows: {
 		id: 'windows',
 		label: 'Windows',
 		cloud: 'Google Drive',
 		folderHint: 'Google Drive (usually G:) → My Drive → Obsidian',
+		fileManager: 'File Explorer',
+		otherDevice: 'other device',
+		deviceExample: 'My laptop',
 	},
 	android: {
 		id: 'android',
 		label: 'Android',
 		cloud: 'Google Drive',
 		folderHint: 'Google Drive → Obsidian',
+		fileManager: 'your files app',
+		otherDevice: 'other device',
+		deviceExample: 'My phone',
 	},
 	linux: {
 		id: 'linux',
 		label: 'Linux',
 		cloud: 'Google Drive',
 		folderHint: 'your Google Drive folder → Obsidian',
+		fileManager: 'your file manager',
+		otherDevice: 'other device',
+		deviceExample: 'My laptop',
 	},
 	unknown: {
 		id: 'unknown',
 		label: 'this device',
 		cloud: 'a sync folder',
 		folderHint: 'a folder your sync client watches',
+		fileManager: 'your file manager',
+		otherDevice: 'other device',
+		deviceExample: 'Other device',
 	},
 };
 
@@ -153,7 +244,13 @@ const DEFAULT_SETTINGS = {
 	notifyOnConflicts: true,
 	showStatusBar: true,
 	/** Paths matching these prefixes never count toward the fingerprint. */
-	excludePrefixes: ['.obsidian/workspace', '.trash/', '.git/', '.jemzsync/'],
+	excludePrefixes: [
+		'.obsidian/workspace',
+		'.trash/',
+		'.git/',
+		'.jemzsync/',
+		SELF_DIR,
+	],
 	/** Filenames ignored everywhere. */
 	excludeNames: ['.DS_Store'],
 	/** Announce this device to the others by writing a small file in the vault. */
@@ -165,6 +262,17 @@ const DEFAULT_SETTINGS = {
 	/** Remembered so a second device can be compared without retyping. */
 	pairedFingerprint: '',
 	pairedDeviceLabel: '',
+	/** Send changes to GitHub automatically, shortly after you stop typing. */
+	githubAutoSync: true,
+	/**
+	 * How often to check GitHub for work done on another device.
+	 *
+	 * Two minutes rather than five: receiving is a poll because GitHub cannot
+	 * notify a plugin, so the interval *is* the latency. Three requests per
+	 * check against a 5,000/hour limit is under 2% of the budget, so there is
+	 * no reason to make people wait longer than this.
+	 */
+	githubPullMinutes: 2,
 };
 
 /* ================================================================== *
@@ -194,6 +302,22 @@ function detectEcosystem(flags) {
 /** Description of an ecosystem, falling back to a neutral one. */
 function ecosystemInfo(id) {
 	return ECOSYSTEMS[id] || ECOSYSTEMS.unknown;
+}
+
+/**
+ * What is actually carrying this vault between devices.
+ *
+ * Normally that is the ecosystem's cloud, but once a vault is stored in a Git
+ * repository the cloud is no longer the answer — and telling a cross-ecosystem
+ * user to "give iCloud a few minutes" would be nonsense. Every message that
+ * names the thing doing the syncing goes through here.
+ *
+ * @param {string} ecosystem
+ * @param {string} [storageMode] 'ecosystem' (default) or 'github'
+ */
+function transportName(ecosystem, storageMode) {
+	if (storageMode === 'github') return 'GitHub';
+	return ecosystemInfo(ecosystem).cloud;
 }
 
 /*
@@ -243,6 +367,30 @@ function detectCloudFolder(p) {
 function classifyVaultLocation(basePath, ctx) {
 	ctx = ctx || {};
 	const ecosystem = ctx.ecosystem || 'apple';
+
+	/*
+	 * When the repository is the storage, a vault sitting in an ordinary
+	 * folder is correct — not broken. Telling someone in this mode to move
+	 * their vault into iCloud would be the same mistake as the two already
+	 * fixed in 1.2.1 and 1.3.0: advising a working setup to move itself.
+	 *
+	 * `both` deliberately does not take this branch. There the cloud really
+	 * is expected to carry the vault as well, so the ordinary checks stand.
+	 */
+	if (ctx.storageMode === STORAGE_GITHUB) {
+		return {
+			code: 'github-primary',
+			ok: true,
+			syncing: true,
+			title: 'Vault is stored in GitHub',
+			detail:
+				'This vault syncs through your GitHub repository, so it does not need to sit in ' +
+				ecosystemInfo(ecosystem).cloud +
+				'. It can live anywhere on this device.',
+			fixes: [],
+		};
+	}
+
 	if (ecosystem !== 'apple') {
 		return classifyDriveLocation(basePath, ctx, ecosystem);
 	}
@@ -815,6 +963,15 @@ function computeFingerprint(entries, opts) {
 		const e = entries[i];
 		const parts = splitPath(e.path);
 		if (isPlaceholder(parts.base)) continue;
+		/*
+		 * Unconditional, not merely a default exclusion. Settings are saved
+		 * into the vault, so anyone upgrading from a version that predates
+		 * this carries the old exclusion list with them — and would go on
+		 * seeing a false mismatch every time the plugin updated. Rejecting it
+		 * here as well means the guard cannot be lost, which is exactly why
+		 * the beacon guard is doubled up too.
+		 */
+		if (e.path.indexOf(SELF_DIR) === 0) continue;
 		if (excludeNames.indexOf(parts.base) !== -1) continue;
 		let skip = false;
 		for (let j = 0; j < excludePrefixes.length; j++) {
@@ -850,8 +1007,14 @@ function computeFingerprint(entries, opts) {
 	};
 }
 
-/** Human-readable comparison of two fingerprints. */
-function compareFingerprints(a, b) {
+/**
+ * Human-readable comparison of two fingerprints.
+ *
+ * `transport` names whatever is moving the files. It is optional so that the
+ * many existing callers keep working, and defaults to wording that is true on
+ * every platform rather than to Apple's.
+ */
+function compareFingerprints(a, b, transport) {
 	if (!a || !b) {
 		return { match: false, summary: 'Nothing to compare yet.' };
 	}
@@ -867,7 +1030,7 @@ function compareFingerprints(a, b) {
 	if (diff > 0) summary += 'The other device has ' + diff + ' more.';
 	else if (diff < 0) summary += 'This device has ' + -diff + ' more.';
 	else summary += 'Same file count, so some file differs in size.';
-	summary += ' Give iCloud a few minutes, then scan again.';
+	summary += ' Wait a few minutes for ' + (transport || 'your sync') + ', then scan again.';
 	return { match: false, summary: summary };
 }
 
@@ -971,12 +1134,12 @@ function shouldWriteBeacon(prev, digest, now, minIntervalMs) {
 }
 
 /** Per-device status lines for the panel. */
-function summarizeDevices(others, localFingerprint, now, staleMs) {
+function summarizeDevices(others, localFingerprint, now, staleMs, transport) {
 	staleMs = staleMs || BEACON_STALE_MS;
 	const out = [];
 	for (let i = 0; i < others.length; i++) {
 		const b = others[i];
-		const cmp = compareFingerprints(localFingerprint, b.fingerprint);
+		const cmp = compareFingerprints(localFingerprint, b.fingerprint, transport);
 		out.push({
 			id: b.id,
 			name: b.name,
@@ -990,6 +1153,184 @@ function summarizeDevices(others, localFingerprint, now, staleMs) {
 		});
 	}
 	return out;
+}
+
+/* ---------------------- pairing auto-fill ---------------------- *
+ *
+ * The "other device" fields in settings predate beacons. They asked you to
+ * copy a digest off one device and type it into another, which is exactly the
+ * information a beacon already carries across on its own. These two functions
+ * connect the one to the other.
+ *
+ * The rule throughout is that the plugin only ever helps into an empty field.
+ * A value you typed is yours; nothing here may overwrite it.
+ */
+
+/**
+ * Which of the other devices to pair with.
+ *
+ * Freshness wins over recency: a device that checked in an hour ago is a
+ * better comparison than one that has been silent for a week, even if the
+ * silent one somehow carries a newer timestamp.
+ *
+ * @param {Array} others beacons belonging to other devices
+ * @param {number} now
+ * @param {number} [staleMs]
+ * @returns {object|null}
+ */
+function pickPairedBeacon(others, now, staleMs) {
+	if (!others || !others.length) return null;
+	staleMs = staleMs || BEACON_STALE_MS;
+
+	let best = null;
+	let bestFresh = false;
+
+	for (let i = 0; i < others.length; i++) {
+		const b = others[i];
+		if (!b || !b.fingerprint || !b.fingerprint.digest) continue;
+
+		/*
+		 * Absolute distance, not elapsed time. Device clocks drift by seconds
+		 * and that is harmless, but a beacon claiming to be from next month is
+		 * not evidence of anything — and read as plain elapsed time it would
+		 * come out *negative*, i.e. fresher than everything, and win.
+		 */
+		const fresh = Math.abs(now - (b.updatedAt || 0)) <= staleMs;
+		if (!best) {
+			best = b;
+			bestFresh = fresh;
+			continue;
+		}
+		if (fresh && !bestFresh) {
+			best = b;
+			bestFresh = true;
+			continue;
+		}
+		if (fresh === bestFresh && (b.updatedAt || 0) > (best.updatedAt || 0)) {
+			best = b;
+			bestFresh = fresh;
+		}
+	}
+	return best;
+}
+
+/**
+ * Decide what a pairing field should hold, given what is in it now, where that
+ * came from, and what the plugin has detected.
+ *
+ * `source` records provenance, and is the whole reason this is safe:
+ *
+ *   'manual'  you typed it — never touched, no matter what is detected
+ *   'auto'    the plugin filled it — refreshed when detection moves on
+ *   ''        empty, or carried over from a version before this existed
+ *
+ * An empty field is always fillable, including one you cleared yourself. That
+ * is deliberate: clearing a field is how you ask for help again.
+ *
+ * @returns {{value: string, source: string, changed: boolean}}
+ */
+function autofillValue(current, source, detected) {
+	const cur = String(current == null ? '' : current).trim();
+	const det = String(detected == null ? '' : detected).trim();
+
+	// Nothing detected: leave the field exactly as it is.
+	if (!det) return { value: cur, source: source || '', changed: false };
+
+	// A typed value outranks anything detected.
+	if (source === 'manual' && cur) {
+		return { value: cur, source: 'manual', changed: false };
+	}
+
+	// Empty — whether never filled, or cleared just now to invite a refill.
+	if (!cur) return { value: det, source: 'auto', changed: cur !== det };
+
+	if (source === 'auto') {
+		return { value: det, source: 'auto', changed: cur !== det };
+	}
+
+	// Non-empty with no provenance: an upgrade from a version that had no
+	// auto-fill, so the only thing it can be is something the user typed.
+	// Claim it as manual so it is protected from here on.
+	return { value: cur, source: 'manual', changed: true };
+}
+
+/* ---------------------- device naming ---------------------- */
+
+/**
+ * A sensible name for this device from Obsidian's platform flags alone.
+ *
+ * The mobile flags are checked before the desktop ones because `isPhone` and
+ * `isTablet` are set on Android too — reading them first is what used to make
+ * an Android phone introduce itself as "iPhone".
+ *
+ * No user-agent parsing: it is brittle, and the field is editable precisely
+ * because a derived label can only ever be a starting point.
+ */
+function suggestDeviceName(flags) {
+	flags = flags || {};
+	if (flags.isIosApp) return flags.isTablet ? 'iPad' : 'iPhone';
+	if (flags.isAndroidApp) return flags.isTablet ? 'Android tablet' : 'Android phone';
+	if (flags.isMacOS && flags.isDesktopApp) return 'Mac';
+	if (flags.isWin) return 'Windows PC';
+	if (flags.isLinux) return 'Linux PC';
+	if (flags.isDesktopApp) return 'Desktop';
+	if (flags.isMobileApp) return 'Mobile';
+	return 'Device';
+}
+
+/**
+ * Devices that have checked in recently enough to still speak for themselves.
+ *
+ * Reinstalling Obsidian, or rebuilding a phone, gives a device a new id and
+ * leaves its old beacon in the vault forever — nothing ever deletes one. Those
+ * ghosts must not go on holding a claim to a name, or a phone that has been
+ * set up twice ends up introducing itself as "iPhone 3".
+ */
+function freshBeacons(others, now, staleMs) {
+	staleMs = staleMs || BEACON_STALE_MS;
+	const out = [];
+	for (let i = 0; i < (others || []).length; i++) {
+		const b = others[i];
+		if (!b) continue;
+		if (Math.abs(now - (b.updatedAt || 0)) <= staleMs) out.push(b);
+	}
+	return out;
+}
+
+/**
+ * Two Macs in one vault both called "Mac" are indistinguishable in the Devices
+ * panel. Beacons already say who is here, so the second one can name itself
+ * "Mac 2" without asking anyone.
+ *
+ * `selfId` is what stops both of them renaming at the same moment. Two fresh
+ * Macs that have not yet seen each other are both "Mac"; when the beacons
+ * finally arrive, an unqualified rule would move both to "Mac 2" and the
+ * collision would simply follow them. So a name is only contested by a device
+ * whose id sorts before ours — exactly one side gives way, and it converges.
+ * Omit `selfId` and any collision contests, which is the simpler rule to
+ * reason about when there is only one candidate.
+ */
+function disambiguateDeviceName(base, others, selfId) {
+	const name = String(base || 'Device');
+	const lower = name.toLowerCase();
+	const taken = Object.create(null);
+	let contested = false;
+
+	for (let i = 0; i < (others || []).length; i++) {
+		const o = others[i];
+		if (!o || !o.name) continue;
+		const otherName = String(o.name).toLowerCase();
+		taken[otherName] = true;
+		if (otherName !== lower) continue;
+		if (!selfId || String(o.id || '') < String(selfId)) contested = true;
+	}
+
+	if (!contested) return name;
+	for (let n = 2; n < 100; n++) {
+		const candidate = name + ' ' + n;
+		if (!taken[candidate.toLowerCase()]) return candidate;
+	}
+	return name;
 }
 
 function formatBytes(n) {
@@ -1052,6 +1393,8 @@ function shouldRescanForChange(path, settings) {
 	const p = String(path || '');
 	if (!p) return false;
 	if (isBeaconPath(p)) return false;
+	// Our own files, for the same reason and with the same belt-and-braces.
+	if (p.indexOf(SELF_DIR) === 0) return false;
 
 	const parts = splitPath(p);
 	const names = settings.excludeNames || [];
@@ -1062,6 +1405,493 @@ function shouldRescanForChange(path, settings) {
 		if (p.indexOf(prefixes[i]) === 0) return false;
 	}
 	return true;
+}
+
+/* ================================================================== *
+ * GITHUB — pure logic
+ *
+ * Everything in this block is I/O-free and unit-tested. The transport
+ * lives further down; keeping the decisions up here means the rules about
+ * what gets uploaded, what never leaves the device, and what happens when
+ * two devices disagree can all be tested without a network.
+ * ================================================================== */
+
+const GITHUB_API = 'https://api.github.com';
+
+/**
+ * Paths that must never be pushed to a repository.
+ *
+ * Deliberately separate from `excludePrefixes`, which decides what counts
+ * toward the vault fingerprint. Conflating them would change what a
+ * fingerprint means, and these two lists answer different questions:
+ * "is this the same vault?" versus "is this safe to publish?".
+ *
+ * The first entry is the important one. Obsidian plugins keep their
+ * configuration — including API keys and access tokens — in
+ * `.obsidian/plugins/<id>/data.json`. Pushing the config folder wholesale
+ * would commit other people's secrets to a Git repository, which is
+ * exactly the sort of accident that is impossible to take back once the
+ * commit exists.
+ */
+const REPO_ALWAYS_EXCLUDE = [
+	{ re: /^\.obsidian\/plugins\/[^/]+\/data\.json$/, why: 'may contain another plugin\'s secrets' },
+	/*
+	 * jemzsync's own code. Two reasons, either sufficient:
+	 *
+	 * Obsidian's developer policy forbids a plugin installing or updating
+	 * itself, and shipping its own main.js to every other device through the
+	 * repository is exactly that.
+	 *
+	 * And it is the same self-reference trap as the fingerprint: updating the
+	 * plugin changes main.js, so a device on the new version and one on the
+	 * old disagree about a file neither user ever touched — which produced a
+	 * "main (github conflicted copy).js" sitting in the repository.
+	 */
+	{ re: /^\.obsidian\/plugins\/jemzsync\//, why: 'the plugin does not sync itself' },
+	{ re: /^\.obsidian\/workspace/, why: 'per-device pane layout' },
+	{ re: /^\.jemzsync\//, why: 'device beacons are local coordination' },
+	{ re: /^\.trash\//, why: 'deleted files' },
+	{ re: /^\.git\//, why: 'git internals' },
+	{ re: /(^|\/)\.DS_Store$/, why: 'macOS folder metadata' },
+	{ re: /(^|\/)\..+\.icloud$/, why: 'an offloaded placeholder, not real content' },
+];
+
+/**
+ * Largest file to upload.
+ *
+ * GitHub blocks anything over 100 MB outright and gets unreliable well
+ * before that. Base64 also inflates a file by a third *and* holds both
+ * copies in memory at once, which matters far more on a phone than on a
+ * desktop. Skipping with a visible warning beats failing the whole sync.
+ */
+const REPO_MAX_FILE_BYTES = 40 * 1024 * 1024;
+
+/** Git's own mode for an ordinary file. The only one a vault needs. */
+const GIT_FILE_MODE = '100644';
+
+/**
+ * Should this path be pushed?
+ *
+ * @returns {{ok: boolean, why: string}} `why` is shown in the preview, so a
+ *   skipped file is always accounted for rather than silently missing.
+ */
+function shouldPushPath(path, size, opts) {
+	opts = opts || {};
+	const p = String(path || '').replace(/^\/+/, '');
+	if (!p) return { ok: false, why: 'empty path' };
+
+	for (let i = 0; i < REPO_ALWAYS_EXCLUDE.length; i++) {
+		if (REPO_ALWAYS_EXCLUDE[i].re.test(p)) {
+			return { ok: false, why: REPO_ALWAYS_EXCLUDE[i].why };
+		}
+	}
+
+	// Optional: some people want the notes and nothing else.
+	if (opts.notesOnly && p.indexOf('.obsidian/') === 0) {
+		return { ok: false, why: 'Obsidian configuration ("notes only" is on)' };
+	}
+
+	const extra = opts.excludePrefixes || [];
+	for (let i = 0; i < extra.length; i++) {
+		if (extra[i] && p.indexOf(extra[i]) === 0) {
+			return { ok: false, why: 'excluded by your settings' };
+		}
+	}
+
+	const max = opts.maxBytes || REPO_MAX_FILE_BYTES;
+	if (size > max) {
+		return { ok: false, why: 'larger than ' + formatBytes(max) };
+	}
+
+	return { ok: true, why: '' };
+}
+
+/**
+ * Work out what has to change in the repository.
+ *
+ * Compares the vault against the tree already on the branch, by Git blob
+ * SHA. That is an exact comparison rather than a guess: a file whose hash
+ * matches the one in the tree is byte-for-byte identical and is not
+ * uploaded, no matter what its timestamps say. This codebase already knows
+ * modification times drift between devices for harmless reasons.
+ *
+ * @param {Array<{path: string, sha: string, size: number}>} local
+ * @param {Object<string,string>} remote path → blob sha already in the repo
+ * @returns {{create: Array, update: Array, remove: Array, unchanged: number}}
+ */
+function buildPushPlan(local, remote) {
+	remote = remote || {};
+	const plan = { create: [], update: [], remove: [], unchanged: 0 };
+	const seen = Object.create(null);
+
+	for (let i = 0; i < (local || []).length; i++) {
+		const f = local[i];
+		seen[f.path] = true;
+		const at = remote[f.path];
+		if (!at) plan.create.push(f);
+		else if (at !== f.sha) plan.update.push(f);
+		else plan.unchanged++;
+	}
+
+	const paths = Object.keys(remote).sort();
+	for (let i = 0; i < paths.length; i++) {
+		if (!seen[paths[i]]) plan.remove.push({ path: paths[i], sha: remote[paths[i]] });
+	}
+
+	plan.create.sort(function (a, b) {
+		return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
+	});
+	plan.update.sort(function (a, b) {
+		return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
+	});
+	return plan;
+}
+
+/** Does this plan change anything at all? */
+function planIsEmpty(plan) {
+	return (
+		!plan ||
+		(plan.create.length === 0 && plan.update.length === 0 && plan.remove.length === 0)
+	);
+}
+
+/**
+ * Does applying this plan destroy anything the user might want back?
+ *
+ * Adding files is safe and applies without interruption. Deleting or
+ * overwriting is not, and is what the confirmation step exists for.
+ */
+function planIsDestructive(plan) {
+	return !!plan && (plan.remove.length > 0 || plan.update.length > 0);
+}
+
+/** One line describing what a push will do. */
+function describePlan(plan) {
+	if (planIsEmpty(plan)) return 'Everything is already up to date.';
+	const bits = [];
+	if (plan.create.length) bits.push(plan.create.length + ' added');
+	if (plan.update.length) bits.push(plan.update.length + ' changed');
+	if (plan.remove.length) bits.push(plan.remove.length + ' removed');
+	return bits.join(', ');
+}
+
+/**
+ * The tree entries for a commit.
+ *
+ * A removal is expressed by handing GitHub the path with a null sha, which
+ * is how the Git Data API spells "this is gone" against a base tree.
+ */
+function buildTreeEntries(plan, shaFor) {
+	const out = [];
+	const changed = plan.create.concat(plan.update);
+	for (let i = 0; i < changed.length; i++) {
+		out.push({
+			path: changed[i].path,
+			mode: GIT_FILE_MODE,
+			type: 'blob',
+			sha: shaFor[changed[i].path],
+		});
+	}
+	for (let i = 0; i < plan.remove.length; i++) {
+		out.push({
+			path: plan.remove[i].path,
+			mode: GIT_FILE_MODE,
+			type: 'blob',
+			sha: null,
+		});
+	}
+	return out;
+}
+
+/* ---------------------- two-way sync ---------------------- *
+ *
+ * Once the repository is carrying the vault between devices, "what changed"
+ * stops being a question with one answer. Both sides can have moved since
+ * they last agreed, and the only way to tell an edit from a deletion is to
+ * remember what they last agreed *on*.
+ *
+ * That remembered state is the base. Without it:
+ *   a file present remotely and absent locally is indistinguishable from
+ *   "they added it" versus "I deleted it" — and guessing wrong either
+ *   resurrects a note you deleted or deletes one they wrote.
+ */
+
+/**
+ * Name for a note pulled down that would have overwritten a local edit.
+ *
+ * Deliberately matches the "conflicted copy" shape that `CONFLICT_PATTERNS`
+ * already recognises, so the existing Keep newest / Merge both buttons pick
+ * it up with no new conflict-resolution code at all.
+ */
+function conflictCopyName(path, when) {
+	const parts = splitPath(path);
+	const stamp = String(when || '').slice(0, 10) || 'sync';
+	return joinPath(parts.dir, parts.stem + ' (github conflicted copy ' + stamp + ')' + parts.ext);
+}
+
+/**
+ * Decide what happens to every path, given three views of it.
+ *
+ * @param {Object<string,string>} base   path → blob sha at the last agreement
+ * @param {Object<string,string>} local  path → blob sha in the vault now
+ * @param {Object<string,string>} remote path → blob sha on the branch now
+ */
+function buildSyncPlan(base, local, remote) {
+	base = base || {};
+	local = local || {};
+	remote = remote || {};
+
+	const plan = {
+		pull: [], // write these into the vault
+		push: [], // send these to the repository
+		deleteLocal: [], // remotely deleted, and untouched here
+		deleteRemote: [], // deleted here, and untouched there
+		conflict: [], // both sides moved
+		unchanged: 0,
+	};
+
+	const paths = Object.create(null);
+	[base, local, remote].forEach(function (m) {
+		Object.keys(m).forEach(function (p) {
+			paths[p] = true;
+		});
+	});
+
+	Object.keys(paths)
+		.sort()
+		.forEach(function (path) {
+			const B = base[path];
+			const L = local[path];
+			const R = remote[path];
+
+			// Already agree. Nothing to do, whether both hold it or neither.
+			if (L === R) {
+				if (L) plan.unchanged++;
+				return;
+			}
+
+			const localMoved = B !== L;
+			const remoteMoved = B !== R;
+
+			if (!localMoved && remoteMoved) {
+				if (R) plan.pull.push({ path: path, sha: R });
+				else plan.deleteLocal.push({ path: path });
+				return;
+			}
+
+			if (localMoved && !remoteMoved) {
+				if (L) plan.push.push({ path: path, sha: L });
+				else plan.deleteRemote.push({ path: path });
+				return;
+			}
+
+			/*
+			 * Both sides moved. Where both still hold the file this is a real
+			 * conflict and both versions are kept.
+			 *
+			 * Where one side deleted and the other edited, the edit wins. A
+			 * deletion carries no information that an edit does not already
+			 * override, and resurrecting a file is recoverable while losing
+			 * someone's writing is not.
+			 */
+			if (L && R) {
+				plan.conflict.push({ path: path, localSha: L, remoteSha: R });
+			} else if (L && !R) {
+				plan.push.push({ path: path, sha: L, note: 'kept: edited here, deleted there' });
+			} else if (R && !L) {
+				plan.pull.push({ path: path, sha: R, note: 'kept: edited there, deleted here' });
+			}
+		});
+
+	return plan;
+}
+
+/** Does this sync plan do anything? */
+function syncPlanIsEmpty(plan) {
+	return (
+		!plan ||
+		(plan.pull.length === 0 &&
+			plan.push.length === 0 &&
+			plan.deleteLocal.length === 0 &&
+			plan.deleteRemote.length === 0 &&
+			plan.conflict.length === 0)
+	);
+}
+
+/** Would applying this plan remove or overwrite anything held locally? */
+function syncPlanIsDestructive(plan) {
+	return !!plan && (plan.deleteLocal.length > 0 || plan.pull.length > 0);
+}
+
+/** One line for a notice or the panel. */
+function describeSyncPlan(plan) {
+	if (syncPlanIsEmpty(plan)) return 'Everything is in sync.';
+	const bits = [];
+	if (plan.push.length) bits.push(plan.push.length + ' sent');
+	if (plan.pull.length) bits.push(plan.pull.length + ' received');
+	if (plan.deleteRemote.length) bits.push(plan.deleteRemote.length + ' removed remotely');
+	if (plan.deleteLocal.length) bits.push(plan.deleteLocal.length + ' removed here');
+	if (plan.conflict.length) bits.push(plan.conflict.length + ' conflicted');
+	return bits.join(', ');
+}
+
+/** `owner/name`, tolerating a full URL or a trailing `.git`. */
+function parseRepoRef(text) {
+	const s = String(text || '')
+		.trim()
+		.replace(/^https?:\/\/(www\.)?github\.com\//i, '')
+		.replace(/\.git$/i, '')
+		.replace(/^\/+|\/+$/g, '');
+	const m = s.match(/^([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+)$/);
+	if (!m) return null;
+	return { owner: m[1], name: m[2], full: m[1] + '/' + m[2] };
+}
+
+/** Follow `Link: <...>; rel="next"` so a long repo list is not truncated. */
+function parseNextLink(linkHeader) {
+	const s = String(linkHeader || '');
+	const parts = s.split(',');
+	for (let i = 0; i < parts.length; i++) {
+		const m = parts[i].match(/<([^>]+)>\s*;\s*rel="next"/);
+		if (m) return m[1];
+	}
+	return null;
+}
+
+/**
+ * Turn an HTTP failure into something worth reading.
+ *
+ * A bare "403" tells nobody anything. Each of these is a different problem
+ * with a different fix, and guessing wrong wastes real time.
+ */
+function classifyGithubError(status, body, path) {
+	const msg = (body && body.message) || '';
+	if (status === 401) {
+		return {
+			fatal: true,
+			message: 'GitHub rejected the token. It may have been revoked or expired — reconnect to fix it.',
+		};
+	}
+	if (status === 403 && /rate limit/i.test(msg)) {
+		return { fatal: false, message: 'GitHub rate limit reached. Waiting before trying again.' };
+	}
+	if (status === 403) {
+		return {
+			fatal: true,
+			message:
+				'The token does not have permission for this repository. It needs Contents: read and write.',
+		};
+	}
+	if (status === 404) {
+		return {
+			fatal: true,
+			message:
+				'Not found: ' +
+				(path || 'the repository') +
+				'. For a private repository this usually means the token was not granted access to it.',
+		};
+	}
+	if (status === 409) {
+		return { fatal: true, message: 'The repository is empty. Add a first commit, or let jemzsync create one.' };
+	}
+	if (status === 422) {
+		return {
+			fatal: false,
+			message:
+				'Another device pushed first, so this push was refused rather than overwriting it. Sync again to merge.',
+		};
+	}
+	if (status >= 500) {
+		return { fatal: false, message: 'GitHub is having trouble (' + status + '). Trying again shortly.' };
+	}
+	return { fatal: true, message: 'GitHub returned ' + status + (msg ? ': ' + msg : '') };
+}
+
+/**
+ * How long to wait before retrying.
+ *
+ * Honours GitHub's own `Retry-After` and the reset timestamp when it sends
+ * them, because guessing shorter than they asked for is how an account
+ * gets throttled harder.
+ */
+function githubBackoffMs(status, headers, attempt) {
+	headers = headers || {};
+	const retryAfter = Number(headers['retry-after'] || headers['Retry-After']);
+	if (retryAfter > 0) return Math.min(retryAfter * 1000, 60000);
+
+	const remaining = Number(headers['x-ratelimit-remaining']);
+	const reset = Number(headers['x-ratelimit-reset']);
+	if (status === 403 && remaining === 0 && reset > 0) {
+		const waitMs = reset * 1000 - Date.now();
+		if (waitMs > 0) return Math.min(waitMs + 1000, 60000);
+	}
+
+	const n = Math.max(0, Number(attempt) || 0);
+	return Math.min(1000 * Math.pow(2, n), 30000);
+}
+
+/**
+ * Is another attempt worth making?
+ *
+ * 409 is here because of a race seen on a real, freshly created repository:
+ * the first commit is written through the Contents API and succeeds, but for
+ * a moment afterwards GitHub still answers "Git Repository is empty" to the
+ * Git Data endpoints. Retrying rides that out. A genuinely empty repository
+ * never reaches here — reading the ref resolves that case first.
+ */
+function githubShouldRetry(status, attempt, maxAttempts) {
+	if (attempt >= (maxAttempts || 4)) return false;
+	return status === 403 || status === 409 || status === 429 || status >= 500;
+}
+
+/* ---------------------- bytes and hashes ---------------------- */
+
+/**
+ * Base64, without Node's Buffer.
+ *
+ * Buffer does not exist on iOS or Android, and using it would quietly make
+ * the plugin desktop-only — the one property this whole file is arranged
+ * to protect. `btoa` is present in both Obsidian's webview and in Node.
+ * Chunked because `String.fromCharCode.apply` blows the argument limit on
+ * anything larger than a small file.
+ */
+function bytesToBase64(bytes) {
+	let binary = '';
+	const CHUNK = 0x8000;
+	for (let i = 0; i < bytes.length; i += CHUNK) {
+		binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+	}
+	return btoa(binary);
+}
+
+function base64ToBytes(b64) {
+	const binary = atob(String(b64 || '').replace(/\s+/g, ''));
+	const out = new Uint8Array(binary.length);
+	for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+	return out;
+}
+
+/**
+ * A file's Git blob SHA: sha1("blob " + length + "\0" + contents).
+ *
+ * Computing the same hash Git computes is what makes the diff exact. The
+ * repository already tells us the blob sha of every file it holds, so a
+ * local file whose hash matches is provably identical and can be skipped —
+ * no timestamps, no size heuristics, no re-uploading a 40 MB attachment
+ * because iCloud restamped it.
+ */
+async function gitBlobSha(bytes) {
+	const header = new TextEncoder().encode('blob ' + bytes.length + '\0');
+	const buf = new Uint8Array(header.length + bytes.length);
+	buf.set(header, 0);
+	buf.set(bytes, header.length);
+	const digest = await crypto.subtle.digest('SHA-1', buf);
+	const view = new Uint8Array(digest);
+	let hex = '';
+	for (let i = 0; i < view.length; i++) {
+		hex += view[i].toString(16).padStart(2, '0');
+	}
+	return hex;
 }
 
 const CORE = {
@@ -1086,8 +1916,14 @@ const CORE = {
 	splitBeacons: splitBeacons,
 	shouldWriteBeacon: shouldWriteBeacon,
 	summarizeDevices: summarizeDevices,
+	pickPairedBeacon: pickPairedBeacon,
+	autofillValue: autofillValue,
+	freshBeacons: freshBeacons,
+	suggestDeviceName: suggestDeviceName,
+	disambiguateDeviceName: disambiguateDeviceName,
 	detectEcosystem: detectEcosystem,
 	ecosystemInfo: ecosystemInfo,
+	transportName: transportName,
 	detectCloudFolder: detectCloudFolder,
 	shouldWarnAboutLocation: shouldWarnAboutLocation,
 	shouldRescanForChange: shouldRescanForChange,
@@ -1098,6 +1934,31 @@ const CORE = {
 	BEACON_STALE_MS: BEACON_STALE_MS,
 	CONFLICT_PATTERNS: CONFLICT_PATTERNS,
 	DEFAULT_SETTINGS: DEFAULT_SETTINGS,
+	SELF_DIR: SELF_DIR,
+
+	/* GitHub, pure half */
+	shouldPushPath: shouldPushPath,
+	buildPushPlan: buildPushPlan,
+	planIsEmpty: planIsEmpty,
+	planIsDestructive: planIsDestructive,
+	describePlan: describePlan,
+	buildTreeEntries: buildTreeEntries,
+	buildSyncPlan: buildSyncPlan,
+	syncPlanIsEmpty: syncPlanIsEmpty,
+	syncPlanIsDestructive: syncPlanIsDestructive,
+	describeSyncPlan: describeSyncPlan,
+	conflictCopyName: conflictCopyName,
+	parseRepoRef: parseRepoRef,
+	parseNextLink: parseNextLink,
+	classifyGithubError: classifyGithubError,
+	githubBackoffMs: githubBackoffMs,
+	githubShouldRetry: githubShouldRetry,
+	bytesToBase64: bytesToBase64,
+	base64ToBytes: base64ToBytes,
+	gitBlobSha: gitBlobSha,
+	REPO_ALWAYS_EXCLUDE: REPO_ALWAYS_EXCLUDE,
+	REPO_MAX_FILE_BYTES: REPO_MAX_FILE_BYTES,
+	GITHUB_API: GITHUB_API,
 };
 
 /* ================================================================== *
@@ -1219,6 +2080,575 @@ async function scanVault(adapter, settings) {
 CORE.scanVault = scanVault;
 
 /* ================================================================== *
+ * GITHUB — transport and API
+ *
+ * One request helper, and the handful of endpoints a vault needs. The
+ * transport is injected rather than imported so the whole client can be
+ * driven by a fake in the tests, the same way the scanner is driven by a
+ * fake adapter.
+ * ================================================================== */
+
+/**
+ * A GitHub client.
+ *
+ * @param {string} token
+ * @param {function} request  ({url, method, headers, body}) → {status, headers, text}
+ * @param {function} [sleep]  injected so tests do not actually wait
+ */
+function githubClient(token, request, sleep) {
+	const wait = sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+
+	/**
+	 * One API call, with retries for the failures that are worth retrying.
+	 *
+	 * Deliberately reads `status` and parses `text` itself rather than
+	 * relying on `throw: false` or the `json` accessor: an error status is
+	 * information here, not an exception, and the response body carries the
+	 * message that makes it diagnosable.
+	 */
+	async function call(method, path, body, opts) {
+		opts = opts || {};
+		const url = path.indexOf('http') === 0 ? path : GITHUB_API + path;
+		let attempt = 0;
+
+		for (;;) {
+			let res;
+			try {
+				res = await request({
+					url: url,
+					method: method,
+					headers: {
+						Authorization: 'Bearer ' + token,
+						Accept: 'application/vnd.github+json',
+						'X-GitHub-Api-Version': '2022-11-28',
+						'User-Agent': 'jemzsync',
+						'Content-Type': 'application/json',
+					},
+					body: body === undefined ? undefined : JSON.stringify(body),
+					throw: false,
+				});
+			} catch (err) {
+				// A dropped connection is not an answer; treat it as retryable.
+				if (attempt >= 3) throw new Error('Could not reach GitHub: ' + (err && err.message));
+				await wait(githubBackoffMs(0, {}, attempt));
+				attempt++;
+				continue;
+			}
+
+			const text = res.text || '';
+			let json = null;
+			if (text) {
+				try {
+					json = JSON.parse(text);
+				} catch (_) {
+					/* an HTML error page, or an empty 204 — json stays null */
+				}
+			}
+
+			if (res.status >= 200 && res.status < 300) {
+				return { status: res.status, json: json, headers: res.headers || {} };
+			}
+
+			/*
+			 * "Does this branch exist yet?" has two negative answers, not one.
+			 * A repository that exists but has never been committed to answers
+			 * 409 "Git Repository is empty" rather than 404 — and treating that
+			 * as a hard error is what stopped a brand-new repository from ever
+			 * receiving its first sync.
+			 */
+			if ((res.status === 404 || res.status === 409) && opts.allowMissing) {
+				return { status: res.status, json: null, headers: res.headers || {}, missing: true };
+			}
+
+			if (githubShouldRetry(res.status, attempt, 4)) {
+				await wait(githubBackoffMs(res.status, res.headers || {}, attempt));
+				attempt++;
+				continue;
+			}
+
+			const info = classifyGithubError(res.status, json, path);
+			const err = new Error(info.message);
+			err.status = res.status;
+			err.fatal = info.fatal;
+			throw err;
+		}
+	}
+
+	/** Walk `Link: rel="next"` so a long list is never silently truncated. */
+	async function paged(path, limit) {
+		const out = [];
+		let next = path;
+		while (next && out.length < (limit || 1000)) {
+			const r = await call('GET', next);
+			if (!Array.isArray(r.json)) break;
+			for (let i = 0; i < r.json.length; i++) out.push(r.json[i]);
+			next = parseNextLink(r.headers.link || r.headers.Link);
+		}
+		return out;
+	}
+
+	return {
+		call: call,
+
+		/** Who the token belongs to — also proves the token works at all. */
+		async whoami() {
+			const r = await call('GET', '/user');
+			return { login: r.json.login, name: r.json.name };
+		},
+
+		/** Repositories the user owns, private ones included. */
+		async listRepos() {
+			const raw = await paged('/user/repos?affiliation=owner&sort=updated&per_page=100', 300);
+			return raw.map((r) => ({
+				full: r.full_name,
+				name: r.name,
+				owner: r.owner && r.owner.login,
+				private: !!r.private,
+				defaultBranch: r.default_branch || 'main',
+			}));
+		},
+
+		async createRepo(name, isPrivate) {
+			const r = await call('POST', '/user/repos', {
+				name: name,
+				private: isPrivate !== false,
+				auto_init: true,
+				description: 'Obsidian vault, synced by jemzsync',
+			});
+			return { full: r.json.full_name, defaultBranch: r.json.default_branch || 'main' };
+		},
+
+		/** Head commit of a branch, or null when the branch does not exist. */
+		async getRef(repo, branch) {
+			const r = await call(
+				'GET',
+				'/repos/' + repo + '/git/ref/heads/' + encodeURIComponent(branch),
+				undefined,
+				{ allowMissing: true }
+			);
+			if (r.missing) return null;
+			return r.json.object.sha;
+		},
+
+		async getCommit(repo, sha) {
+			const r = await call('GET', '/repos/' + repo + '/git/commits/' + sha);
+			return { sha: r.json.sha, tree: r.json.tree.sha };
+		},
+
+		/**
+		 * Every file on the branch, as path → blob sha.
+		 *
+		 * GitHub caps a recursive tree at 100,000 entries and 7 MB, and sets
+		 * `truncated` when it hits that. A truncated tree looks exactly like a
+		 * repository missing files, so pushing against one would delete
+		 * everything it failed to mention. It is refused instead.
+		 */
+		async readTree(repo, treeSha) {
+			const r = await call(
+				'GET',
+				'/repos/' + repo + '/git/trees/' + treeSha + '?recursive=1'
+			);
+			if (r.json.truncated) {
+				throw new Error(
+					'This repository is too large for jemzsync to read in one request, so it cannot safely work out what changed. Syncing has stopped rather than risk removing files.'
+				);
+			}
+			const map = Object.create(null);
+			const tree = r.json.tree || [];
+			for (let i = 0; i < tree.length; i++) {
+				if (tree[i].type === 'blob') map[tree[i].path] = tree[i].sha;
+			}
+			return map;
+		},
+
+		/**
+		 * Put the very first commit on a branch.
+		 *
+		 * A repository with no commits at all rejects the entire Git Data
+		 * API — `POST /git/blobs` itself answers 409 "Git Repository is
+		 * empty", so there is no way to build up a tree and commit the usual
+		 * way. The Contents API is the one endpoint that works in that state,
+		 * so it is used exactly once, to create a root commit out of a single
+		 * real file. Everything after that goes the efficient route.
+		 *
+		 * A freshly created repository is the normal case here, so this is a
+		 * first-run path rather than an edge case.
+		 */
+		async bootstrapBranch(repo, branch, filePath, base64, message) {
+			const encoded = String(filePath)
+				.split('/')
+				.map(encodeURIComponent)
+				.join('/');
+			const r = await call('PUT', '/repos/' + repo + '/contents/' + encoded, {
+				message: message || 'jemzsync: first commit',
+				content: base64,
+				branch: branch,
+			});
+			return r.json.commit.sha;
+		},
+
+		/** A file's contents, as bytes. */
+		async readBlob(repo, sha) {
+			const r = await call('GET', '/repos/' + repo + '/git/blobs/' + sha);
+			return base64ToBytes(r.json.content || '');
+		},
+
+		async createBlob(repo, base64) {
+			const r = await call('POST', '/repos/' + repo + '/git/blobs', {
+				content: base64,
+				encoding: 'base64',
+			});
+			return r.json.sha;
+		},
+
+		async createTree(repo, entries, baseTree) {
+			const body = { tree: entries };
+			if (baseTree) body.base_tree = baseTree;
+			const r = await call('POST', '/repos/' + repo + '/git/trees', body);
+			return r.json.sha;
+		},
+
+		async createCommit(repo, message, treeSha, parents) {
+			const r = await call('POST', '/repos/' + repo + '/git/commits', {
+				message: message,
+				tree: treeSha,
+				parents: parents || [],
+			});
+			return r.json.sha;
+		},
+
+		/**
+		 * Move the branch to a new commit.
+		 *
+		 * `force` is deliberately absent. If another device pushed in the
+		 * meantime this is not a fast-forward and GitHub refuses with 422 —
+		 * which is the correct outcome. Forcing here would silently erase
+		 * whatever the other device had just written.
+		 */
+		async updateRef(repo, branch, sha) {
+			await call('PATCH', '/repos/' + repo + '/git/refs/heads/' + encodeURIComponent(branch), {
+				sha: sha,
+			});
+		},
+
+		async createRef(repo, branch, sha) {
+			await call('POST', '/repos/' + repo + '/git/refs', {
+				ref: 'refs/heads/' + branch,
+				sha: sha,
+			});
+		},
+	};
+}
+
+/**
+ * Read the vault and work out what the repository is missing.
+ *
+ * Hashes every eligible file the way Git would, so the comparison against
+ * the repository's own tree is exact rather than a guess.
+ *
+ * @param {function} listFiles  () → [{path, size}]
+ * @param {function} readBytes  (path) → Uint8Array
+ * @param {object} opts  {notesOnly, excludePrefixes, maxBytes}
+ */
+async function collectPushable(listFiles, readBytes, opts) {
+	const files = [];
+	const skipped = [];
+	const errors = [];
+	const entries = await listFiles();
+
+	for (let i = 0; i < entries.length; i++) {
+		const e = entries[i];
+		const verdict = shouldPushPath(e.path, e.size, opts);
+		if (!verdict.ok) {
+			skipped.push({ path: e.path, why: verdict.why });
+			continue;
+		}
+		try {
+			const bytes = await readBytes(e.path);
+			files.push({ path: e.path, size: bytes.length, sha: await gitBlobSha(bytes) });
+		} catch (err) {
+			// A file we cannot read must not be treated as deleted, or the push
+			// would remove it from the repository. Recorded and left alone.
+			errors.push({ path: e.path, message: String((err && err.message) || err) });
+		}
+	}
+
+	files.sort(function (a, b) {
+		return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
+	});
+	return { files: files, skipped: skipped, errors: errors };
+}
+
+/**
+ * Refuse to sync from a partial view of the vault.
+ *
+ * The scanner stops after a hard cap, and every file past it would be absent
+ * from the local list — which reads as "deleted" and removes them from the
+ * repository. A partial view is never safe to act on.
+ */
+function assertScanComplete(scan) {
+	if (scan && scan.truncated) {
+		throw new Error(
+			'This vault has more files than jemzsync can scan in one pass, so it cannot tell what changed. Syncing has stopped rather than risk removing files.'
+		);
+	}
+}
+
+/**
+ * Files that exist but cannot be read at this moment.
+ *
+ * iCloud replaces a file's contents with a `.icloud` stub whenever it wants
+ * disk space back, and the scanner reports those separately — so they never
+ * reach the upload list. Left at that, the sync concludes they were deleted
+ * and removes them from the repository. On an Apple vault that is routine.
+ *
+ * They are reported the same way an unreadable file is, which the sync engine
+ * already knows to leave untouched on both sides.
+ */
+function unreadableFromScan(scan) {
+	const out = [];
+	const list = (scan && scan.placeholders) || [];
+	for (let i = 0; i < list.length; i++) {
+		out.push({ path: list[i].expects, message: 'not downloaded from the cloud yet' });
+	}
+	return out;
+}
+
+/**
+ * Remove a file in a way that can be undone.
+ *
+ * Never a plain delete. Obsidian's file index lags behind the disk for a note
+ * created moments ago, so the lookup can return nothing for a file that
+ * certainly exists — and falling back to `remove` made a sync-triggered
+ * deletion permanently unrecoverable. That happened on a real vault. Anything
+ * the index does not know about is moved into the vault's own trash by hand.
+ */
+async function trashPath(app, adapter, path) {
+	const file = app.vault.getAbstractFileByPath(path);
+	if (file) {
+		await app.fileManager.trashFile(file);
+		return 'obsidian-trash';
+	}
+	try {
+		if (!(await adapter.exists('.trash'))) await adapter.mkdir('.trash');
+		await adapter.rename(path, '.trash/' + splitPath(path).base);
+		return 'vault-trash';
+	} catch (_) {
+		/*
+		 * Even a failed rescue beats deleting it outright: the file stays
+		 * where it is and the next sync reports the difference again.
+		 */
+		return 'kept';
+	}
+}
+
+/**
+ * A full two-way sync: work out what moved on both sides, then apply it.
+ *
+ * @param {object} io  everything that touches the world, injected so the
+ *   whole engine can be driven by fakes:
+ *   {readBytes, writeBytes, trash, listLocal, base, saveBase, now}
+ */
+async function githubSync(client, repo, branch, io, opts) {
+	opts = opts || {};
+
+	const collected = await io.listLocal();
+
+	/*
+	 * The local side is read first because bootstrapping an empty repository
+	 * needs a real file to make the root commit out of — see bootstrapBranch
+	 * for why an empty repository cannot be written any other way.
+	 */
+	let headSha = await client.getRef(repo, branch);
+	if (!headSha && collected.files.length && !opts.dryRun) {
+		const first = collected.files[0];
+		const bytes = await io.readBytes(first.path);
+		headSha = await client.bootstrapBranch(
+			repo,
+			branch,
+			first.path,
+			bytesToBase64(bytes),
+			(opts.message || 'jemzsync') + ' — first commit'
+		);
+	}
+
+	let baseTree = null;
+	let remote = Object.create(null);
+	if (headSha) {
+		const commit = await client.getCommit(repo, headSha);
+		baseTree = commit.tree;
+		remote = await client.readTree(repo, baseTree);
+	}
+	const local = Object.create(null);
+	for (let i = 0; i < collected.files.length; i++) {
+		local[collected.files[i].path] = collected.files[i].sha;
+	}
+
+	/*
+	 * A file we could not read is not a file that was deleted. Carrying its
+	 * last-known hash into both the local and base views makes it look
+	 * untouched, so nothing happens to it on either side.
+	 */
+	for (let i = 0; i < collected.errors.length; i++) {
+		const p = collected.errors[i].path;
+		if (io.base[p]) local[p] = io.base[p];
+	}
+
+	/*
+	 * Sanity-check the read before trusting it with deletions.
+	 *
+	 * If the branch is still exactly where our own last push left it, then
+	 * nobody else has committed, so the tree we just read must contain
+	 * everything we put there. When it does not, the read is stale — GitHub
+	 * will occasionally serve a tree from just before a very recent commit —
+	 * and believing it means concluding that files we created seconds ago were
+	 * deleted by someone else, and removing them locally.
+	 *
+	 * That is exactly what happened on a real vault: a note was pushed
+	 * successfully and then deleted off the disk moments later.
+	 */
+	if (opts.lastCommit && headSha === opts.lastCommit) {
+		const missing = [];
+		const known = Object.keys(io.base);
+		for (let i = 0; i < known.length; i++) {
+			if (!(known[i] in remote)) missing.push(known[i]);
+		}
+		if (missing.length) {
+			throw new Error(
+				'GitHub returned an incomplete view of the branch (' +
+					missing.length +
+					' known file(s) missing). Syncing stopped rather than risk deleting them.'
+			);
+		}
+	}
+
+	const plan = buildSyncPlan(io.base, local, remote);
+	plan.remoteTree = remote;
+	plan.headSha = headSha;
+
+	/*
+	 * Last line of defence. Any bug that makes the vault look empty — a failed
+	 * scan, a permissions problem, a wrong folder — turns into "delete
+	 * everything" without this. A handful of deletions is ordinary; most of
+	 * the repository disappearing at once never is.
+	 */
+	const remoteCount = Object.keys(remote).length;
+	const removing = plan.deleteRemote.length;
+	if (!opts.confirmedBulkDelete && remoteCount >= 4 && removing > remoteCount / 2) {
+		throw new Error(
+			'This sync would remove ' +
+				removing +
+				' of ' +
+				remoteCount +
+				' files from the repository. That is more than looks like an ordinary edit, so it has been stopped. Sync from the panel to review and confirm it.'
+		);
+	}
+
+	if (syncPlanIsEmpty(plan)) {
+		/*
+		 * Being already in step IS an agreement, and it has to be written
+		 * down. Returning here without recording it left the device with no
+		 * memory of ever having agreed — so the next edit made on the other
+		 * side compared against an empty base, looked like a change on both
+		 * sides at once, and was reported as a conflict that never happened.
+		 *
+		 * It bites hardest on a fresh repository, where the first sync only
+		 * bootstraps and therefore has nothing else to do.
+		 */
+		if (!opts.dryRun) {
+			await io.saveBase(Object.assign(Object.create(null), remote), headSha);
+		}
+		return { plan: plan, applied: false, reason: 'in-sync', commit: headSha };
+	}
+	if (opts.dryRun) {
+		return { plan: plan, applied: false, reason: 'dry-run', commit: headSha };
+	}
+
+	/*
+	 * Adding files needs no permission. Overwriting or removing what is on
+	 * this device does — it is the last moment at which a mistake is still
+	 * cheap. The plan is handed back so the caller can show exactly what would
+	 * happen, and nothing is touched until it comes back confirmed.
+	 */
+	if (!opts.confirmed && syncPlanIsDestructive(plan)) {
+		return { plan: plan, applied: false, reason: 'needs-confirmation', commit: headSha };
+	}
+
+	const nextBase = Object.assign(Object.create(null), io.base);
+
+	/* ---- incoming ---- */
+
+	for (let i = 0; i < plan.pull.length; i++) {
+		const item = plan.pull[i];
+		const bytes = await client.readBlob(repo, item.sha);
+		await io.writeBytes(item.path, bytes);
+		nextBase[item.path] = item.sha;
+	}
+
+	for (let i = 0; i < plan.deleteLocal.length; i++) {
+		// Trashed, never destroyed: a sync that removes a note has to be
+		// recoverable on the device it removed it from.
+		await io.trash(plan.deleteLocal[i].path);
+		delete nextBase[plan.deleteLocal[i].path];
+	}
+
+	/* ---- conflicts: keep both, and let the existing UI sort it out ---- */
+
+	const stamp = new Date(io.now ? io.now() : Date.now()).toISOString().slice(0, 10);
+	for (let i = 0; i < plan.conflict.length; i++) {
+		const c = plan.conflict[i];
+		const bytes = await client.readBlob(repo, c.remoteSha);
+		const copyPath = conflictCopyName(c.path, stamp);
+		await io.writeBytes(copyPath, bytes);
+		c.copyPath = copyPath;
+		// The local version is still ours and still needs sending, so the
+		// other device sees the disagreement too rather than only this one.
+		plan.push.push({ path: c.path, sha: c.localSha, note: 'conflicted' });
+	}
+
+	/* ---- outgoing, as one commit ---- */
+
+	let commitSha = headSha;
+	const outgoing = plan.push.slice();
+	const removals = plan.deleteRemote.slice();
+
+	if (outgoing.length || removals.length) {
+		const shaFor = Object.create(null);
+		for (let i = 0; i < outgoing.length; i++) {
+			const bytes = await io.readBytes(outgoing[i].path);
+			shaFor[outgoing[i].path] = await client.createBlob(repo, bytesToBase64(bytes));
+			if (opts.onProgress) opts.onProgress(i + 1, outgoing.length, outgoing[i].path);
+		}
+
+		const entries = buildTreeEntries(
+			{ create: outgoing, update: [], remove: removals },
+			shaFor
+		);
+		const treeSha = await client.createTree(repo, entries, baseTree);
+		commitSha = await client.createCommit(
+			repo,
+			opts.message || 'jemzsync: sync vault',
+			treeSha,
+			headSha ? [headSha] : []
+		);
+
+		if (headSha) await client.updateRef(repo, branch, commitSha);
+		else await client.createRef(repo, branch, commitSha);
+
+		for (let i = 0; i < outgoing.length; i++) {
+			nextBase[outgoing[i].path] = shaFor[outgoing[i].path];
+		}
+		for (let i = 0; i < removals.length; i++) delete nextBase[removals[i].path];
+
+		// A conflict copy is a local file like any other; it goes up on the
+		// next round rather than being special-cased here.
+	}
+
+	await io.saveBase(nextBase, commitSha);
+	return { plan: plan, applied: true, reason: 'synced', commit: commitSha };
+}
+
+/* ================================================================== *
  * OBSIDIAN INTEGRATION
  * ================================================================== */
 
@@ -1229,6 +2659,22 @@ const Modal = ob.Modal;
 const Setting = ob.Setting;
 const Notice = ob.Notice;
 const Platform = ob.Platform;
+const requestUrl = ob.requestUrl;
+
+/**
+ * The one place this plugin touches the network.
+ *
+ * `requestUrl` is Obsidian's own HTTP call. It is used rather than `fetch`
+ * because it is not subject to CORS and because it is the only thing that
+ * works on iOS and Android — where a plugin has no other way out. Nothing
+ * here is called unless a GitHub token has been entered.
+ */
+function obsidianRequest(params) {
+	if (typeof requestUrl !== 'function') {
+		return Promise.reject(new Error('Network requests are unavailable in this build.'));
+	}
+	return requestUrl(params);
+}
 
 function currentPlatform() {
 	if (Platform && Platform.isMobileApp) return 'mobile';
@@ -1241,14 +2687,15 @@ function currentEcosystem() {
 	return detectEcosystem(Platform || {});
 }
 
-/** A friendly default label for this device, refined per Apple device type. */
+/**
+ * A friendly default label for this device.
+ *
+ * Delegates to the pure `suggestDeviceName` so the rule is testable. It used
+ * to read `isPhone` first, which is set on Android too — an Android phone
+ * introduced itself to the other devices as "iPhone".
+ */
 function defaultDeviceName() {
-	if (Platform && Platform.isPhone) return 'iPhone';
-	if (Platform && Platform.isTablet) return 'iPad';
-	if (Platform && Platform.isMacOS && Platform.isDesktopApp) return 'Mac';
-	if (Platform && Platform.isDesktopApp) return 'Desktop';
-	if (Platform && Platform.isMobileApp) return 'Mobile';
-	return 'Device';
+	return suggestDeviceName(Platform || {});
 }
 
 /* ---------------------- per-device state ---------------------- *
@@ -1297,8 +2744,17 @@ function loadDeviceIdentity(app) {
 		id = newDeviceId();
 		writeLocal(app, 'jemzsync-device-id', id);
 	}
-	const name = readLocal(app, 'jemzsync-device-name') || defaultDeviceName();
-	return { id: id, name: name, platform: defaultDeviceName() };
+	const chosen = readLocal(app, 'jemzsync-device-name');
+	return {
+		id: id,
+		name: chosen || defaultDeviceName(),
+		platform: defaultDeviceName(),
+		/*
+		 * Whether the name came from the user. A derived name may be adjusted
+		 * once the beacons show who else is here; a chosen one never is.
+		 */
+		named: !!chosen,
+	};
 }
 
 /*
@@ -1316,6 +2772,272 @@ function saveDismissedWarning(app, code) {
 
 function saveDeviceName(app, name) {
 	writeLocal(app, 'jemzsync-device-name', name);
+}
+
+/* ---------------------- paired device, per device ---------------------- *
+ *
+ * "The other device" is a different device depending on which one you are
+ * standing at, so this cannot live in `saveData` — and once it is filled in
+ * automatically, storing it there is actively harmful:
+ *
+ *   The Mac writes the iPhone's digest into the shared data.json. iCloud
+ *   carries that file to the iPhone, which overwrites it with the Mac's
+ *   digest, which comes back... forever. And because data.json sits in the
+ *   vault, every one of those writes changes the vault fingerprint, so the
+ *   two devices could never report a match again.
+ *
+ * Per-device storage removes the loop and the churn at once. Older versions
+ * kept these in settings, so a value found there is migrated across once and
+ * treated as hand-typed, which it must have been.
+ */
+
+const PAIRED_KEYS = {
+	fingerprint: 'jemzsync-paired-fingerprint',
+	fingerprintSource: 'jemzsync-paired-fingerprint-source',
+	files: 'jemzsync-paired-files',
+	bytes: 'jemzsync-paired-bytes',
+	label: 'jemzsync-paired-label',
+	labelSource: 'jemzsync-paired-label-source',
+};
+
+function loadPairing(app, settings) {
+	settings = settings || {};
+
+	let fingerprint = readLocal(app, PAIRED_KEYS.fingerprint);
+	let fingerprintSource = readLocal(app, PAIRED_KEYS.fingerprintSource);
+	let label = readLocal(app, PAIRED_KEYS.label);
+	let labelSource = readLocal(app, PAIRED_KEYS.labelSource);
+
+	// Migrate a value typed into an older version, once. The settings copy is
+	// left alone rather than cleared: rewriting data.json here would change
+	// the vault fingerprint on upgrade, which is the one thing this whole
+	// change exists to avoid.
+	if (!fingerprint && settings.pairedFingerprint) {
+		fingerprint = String(settings.pairedFingerprint);
+		fingerprintSource = 'manual';
+		writeLocal(app, PAIRED_KEYS.fingerprint, fingerprint);
+		writeLocal(app, PAIRED_KEYS.fingerprintSource, 'manual');
+	}
+	if (!label && settings.pairedDeviceLabel) {
+		label = String(settings.pairedDeviceLabel);
+		labelSource = 'manual';
+		writeLocal(app, PAIRED_KEYS.label, label);
+		writeLocal(app, PAIRED_KEYS.labelSource, 'manual');
+	}
+
+	return {
+		fingerprint: fingerprint || '',
+		fingerprintSource: fingerprintSource || '',
+		files: Number(readLocal(app, PAIRED_KEYS.files)) || 0,
+		bytes: Number(readLocal(app, PAIRED_KEYS.bytes)) || 0,
+		label: label || '',
+		labelSource: labelSource || '',
+	};
+}
+
+function savePairing(app, pairing) {
+	writeLocal(app, PAIRED_KEYS.fingerprint, pairing.fingerprint || '');
+	writeLocal(app, PAIRED_KEYS.fingerprintSource, pairing.fingerprintSource || '');
+	writeLocal(app, PAIRED_KEYS.files, String(pairing.files || 0));
+	writeLocal(app, PAIRED_KEYS.bytes, String(pairing.bytes || 0));
+	writeLocal(app, PAIRED_KEYS.label, pairing.label || '');
+	writeLocal(app, PAIRED_KEYS.labelSource, pairing.labelSource || '');
+}
+
+/* ---------------------- GitHub, per device ---------------------- *
+ *
+ * The access token is the single most sensitive thing this plugin handles,
+ * and `saveData` is the one place it must never go. `saveData` writes into
+ * the vault — the vault that iCloud replicates to every device, and that
+ * we are about to commit to a Git repository. A token stored there would
+ * be copied to every device and then published into the repo it unlocks.
+ *
+ * So it lives here, in per-device storage, alongside the device id: on
+ * this machine, never synced, never in a commit. The repository choice
+ * sits beside it for the same reason — each device is set up once, by its
+ * owner, and nothing about that has to travel.
+ */
+
+const GITHUB_KEYS = {
+	mode: 'jemzsync-storage-mode',
+	token: 'jemzsync-github-token',
+	login: 'jemzsync-github-login',
+	repo: 'jemzsync-github-repo',
+	branch: 'jemzsync-github-branch',
+	lastCommit: 'jemzsync-github-last-commit',
+	lastSyncAt: 'jemzsync-github-last-sync',
+	notesOnly: 'jemzsync-github-notes-only',
+};
+
+function loadGithubConfig(app) {
+	const mode = readLocal(app, GITHUB_KEYS.mode) || STORAGE_ECOSYSTEM;
+	return {
+		mode: mode,
+		token: readLocal(app, GITHUB_KEYS.token) || '',
+		login: readLocal(app, GITHUB_KEYS.login) || '',
+		repo: readLocal(app, GITHUB_KEYS.repo) || '',
+		branch: readLocal(app, GITHUB_KEYS.branch) || 'main',
+		lastCommit: readLocal(app, GITHUB_KEYS.lastCommit) || '',
+		lastSyncAt: Number(readLocal(app, GITHUB_KEYS.lastSyncAt)) || 0,
+		notesOnly: readLocal(app, GITHUB_KEYS.notesOnly) === 'true',
+	};
+}
+
+function saveGithubConfig(app, cfg) {
+	writeLocal(app, GITHUB_KEYS.mode, cfg.mode || STORAGE_ECOSYSTEM);
+	writeLocal(app, GITHUB_KEYS.token, cfg.token || '');
+	writeLocal(app, GITHUB_KEYS.login, cfg.login || '');
+	writeLocal(app, GITHUB_KEYS.repo, cfg.repo || '');
+	writeLocal(app, GITHUB_KEYS.branch, cfg.branch || 'main');
+	writeLocal(app, GITHUB_KEYS.lastCommit, cfg.lastCommit || '');
+	writeLocal(app, GITHUB_KEYS.lastSyncAt, String(cfg.lastSyncAt || 0));
+	writeLocal(app, GITHUB_KEYS.notesOnly, cfg.notesOnly ? 'true' : 'false');
+}
+
+/**
+ * The last state this device and the repository agreed on.
+ *
+ * Per device, because it describes what *this* device last saw — and it must
+ * not sync, or every device would inherit another's idea of the past and
+ * mistake untouched files for changes.
+ *
+ * Stored as JSON. A very large vault could outgrow the storage quota, in
+ * which case the write is dropped and the next sync simply has no base: it
+ * then treats a difference on both sides as a conflict and keeps both copies,
+ * which is the safe way to be wrong.
+ */
+function loadSyncBase(app) {
+	const raw = readLocal(app, 'jemzsync-github-base');
+	if (!raw) return Object.create(null);
+	try {
+		const parsed = JSON.parse(raw);
+		return parsed && typeof parsed === 'object' ? parsed : Object.create(null);
+	} catch (_) {
+		return Object.create(null);
+	}
+}
+
+function saveSyncBase(app, base) {
+	try {
+		writeLocal(app, 'jemzsync-github-base', JSON.stringify(base));
+	} catch (_) {
+		/* quota — the next sync falls back to conflict-and-keep-both */
+	}
+}
+
+/** Never show a token in full; enough to recognise, not enough to use. */
+function maskToken(token) {
+	const t = String(token || '');
+	if (!t) return '';
+	if (t.length <= 12) return '••••';
+	return t.slice(0, 7) + '…' + t.slice(-4);
+}
+
+/**
+ * What, if anything, is wrong with the GitHub setup.
+ *
+ * The counterpart to `classifyVaultLocation`: in GitHub mode the vault's
+ * folder is no longer the thing that can be misconfigured, so these are
+ * the failures worth surfacing instead.
+ */
+function classifyGithubHealth(cfg, now) {
+	if (!storageUsesGithub(cfg.mode)) return { ok: true, code: 'unused', title: '', detail: '' };
+
+	if (!cfg.token) {
+		return {
+			ok: false,
+			code: 'not-connected',
+			title: 'Not connected to GitHub',
+			detail:
+				cfg.mode === STORAGE_GITHUB
+					? 'This vault is set to sync through GitHub, but no account is connected — so nothing is being saved anywhere. Connect one, or change where the vault is stored.'
+					: 'GitHub is switched on as a second copy, but no account is connected yet.',
+		};
+	}
+	if (!cfg.repo) {
+		return {
+			ok: false,
+			code: 'no-repo',
+			title: 'No repository chosen',
+			detail: 'Connected as ' + (cfg.login || 'your account') + ', but no repository is selected yet.',
+		};
+	}
+	if (!cfg.lastSyncAt) {
+		return {
+			ok: false,
+			code: 'never-synced',
+			title: 'Never synced',
+			detail: 'Set up and ready, but nothing has been sent to ' + cfg.repo + ' yet.',
+		};
+	}
+
+	const days = (now - cfg.lastSyncAt) / (24 * 3600 * 1000);
+	if (days >= 7) {
+		return {
+			ok: false,
+			code: 'stale',
+			title: 'Not synced for ' + Math.floor(days) + ' days',
+			detail: 'The last successful sync to ' + cfg.repo + ' was a while ago.',
+		};
+	}
+
+	return {
+		ok: true,
+		code: 'ok',
+		title: 'Syncing with ' + cfg.repo,
+		detail: 'Last sync ' + timeAgo(cfg.lastSyncAt) + '.',
+	};
+}
+
+/**
+ * Fold what the beacons reported into the stored pairing.
+ *
+ * Kept separate from the plugin class so the whole rule — including "never
+ * overwrite a typed value" — is testable without an Obsidian app.
+ *
+ * @returns {{pairing: object, changed: boolean}}
+ */
+function applyPairingAutofill(pairing, others, now) {
+	const picked = pickPairedBeacon(others, now);
+	if (!picked) return { pairing: pairing, changed: false };
+
+	const fp = autofillValue(
+		pairing.fingerprint,
+		pairing.fingerprintSource,
+		picked.fingerprint.digest
+	);
+	const nm = autofillValue(pairing.label, pairing.labelSource, picked.name);
+
+	const next = {
+		fingerprint: fp.value,
+		fingerprintSource: fp.source,
+		label: nm.value,
+		labelSource: nm.source,
+		files: pairing.files,
+		bytes: pairing.bytes,
+	};
+
+	// File counts only mean anything next to the digest they came from. Carry
+	// them when the stored digest is the detected one, and drop them when it
+	// is not — a hand-typed digest has no counts, and pretending otherwise is
+	// what made the panel report "same file count" for vaults that differed.
+	if (fp.value === picked.fingerprint.digest) {
+		next.files = picked.fingerprint.files || 0;
+		next.bytes = picked.fingerprint.bytes || 0;
+	} else {
+		next.files = 0;
+		next.bytes = 0;
+	}
+
+	const changed =
+		next.fingerprint !== pairing.fingerprint ||
+		next.fingerprintSource !== pairing.fingerprintSource ||
+		next.label !== pairing.label ||
+		next.labelSource !== pairing.labelSource ||
+		next.files !== pairing.files ||
+		next.bytes !== pairing.bytes;
+
+	return { pairing: next, changed: changed };
 }
 
 /**
@@ -1366,6 +3088,8 @@ class JemzSyncPlugin extends Plugin {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 		this.lastScan = null;
 		this.identity = loadDeviceIdentity(this.app);
+		this.pairing = loadPairing(this.app, this.settings);
+		this.github = loadGithubConfig(this.app);
 		this.ecosystem = currentEcosystem();
 		this.liveTimer = null;
 
@@ -1390,8 +3114,13 @@ class JemzSyncPlugin extends Plugin {
 		});
 
 		this.addCommand({
+			/*
+			 * The id must not change — user hotkeys are bound to it. Only the
+			 * label moves, because "iCloud" was showing in the command palette
+			 * on Windows, Android and Linux too.
+			 */
 			id: 'check-setup',
-			name: 'Check iCloud setup',
+			name: 'Check sync setup',
 			callback: async () => {
 				await this.runScan(true);
 				await this.activateView();
@@ -1424,6 +3153,24 @@ class JemzSyncPlugin extends Plugin {
 			},
 		});
 
+		this.addCommand({
+			id: 'push-to-github',
+			name: 'Sync vault with GitHub',
+			checkCallback: (checking) => {
+				const ready = storageUsesGithub(this.github.mode) && !!this.github.token && !!this.github.repo;
+				if (checking) return ready;
+				if (!ready) return false;
+				this.syncWithGithub({})
+					.then((res) =>
+						new Notice(
+							res.applied ? describeSyncPlan(res.plan) + '.' : 'Already in sync.'
+						)
+					)
+					.catch((err) => new Notice(String((err && err.message) || err)));
+				return true;
+			},
+		});
+
 		this.addSettingTab(new JemzSyncSettingTab(this.app, this));
 
 		if (this.settings.scanOnStartup) {
@@ -1441,6 +3188,7 @@ class JemzSyncPlugin extends Plugin {
 		}
 
 		if (this.settings.watchVault) this.startWatching();
+		this.startGithubAutoSync();
 	}
 
 	/**
@@ -1454,6 +3202,8 @@ class JemzSyncPlugin extends Plugin {
 			const path = file && (file.path || file);
 			if (!shouldRescanForChange(path, this.settings)) return;
 			this.scheduleLiveScan();
+			// Files we just wrote ourselves must not start another round.
+			if (!this.applyingRemote) this.scheduleGithubSync();
 		};
 		const vault = this.app.vault;
 		this.registerEvent(vault.on('create', onChange));
@@ -1489,6 +3239,7 @@ class JemzSyncPlugin extends Plugin {
 
 	onunload() {
 		if (this.liveTimer) window.clearTimeout(this.liveTimer);
+		if (this.githubTimer) window.clearTimeout(this.githubTimer);
 		/* Obsidian detaches leaves, events and intervals registered above. */
 	}
 
@@ -1515,7 +3266,9 @@ class JemzSyncPlugin extends Plugin {
 			platform: currentPlatform(),
 			vaultName: this.app.vault.getName(),
 			ecosystem: this.ecosystem,
+			storageMode: this.github.mode,
 		});
+		scan.githubHealth = classifyGithubHealth(this.github, Date.now());
 		await this.syncBeacons(scan);
 		this.lastScan = scan;
 
@@ -1562,7 +3315,16 @@ class JemzSyncPlugin extends Plugin {
 			}
 
 			const split = splitBeacons(beacons, this.identity.id);
-			scan.devices = summarizeDevices(split.others, scan.fingerprint, Date.now());
+			scan.devices = summarizeDevices(
+				split.others,
+				scan.fingerprint,
+				Date.now(),
+				BEACON_STALE_MS,
+				transportName(this.ecosystem)
+			);
+
+			this.autoNameThisDevice(split.others);
+			this.autofillPairing(split.others);
 
 			if (this.settings.writeBeacon) {
 				const due = shouldWriteBeacon(
@@ -1576,6 +3338,40 @@ class JemzSyncPlugin extends Plugin {
 		} catch (_) {
 			/* beacons are an extra; the scan result stands without them */
 		}
+	}
+
+	/**
+	 * Give this device a name that is distinct from the others, unless the user
+	 * has chosen one — in which case it is left completely alone.
+	 *
+	 * Not persisted: it is derived from whoever else is currently in the vault,
+	 * so re-deriving it each scan keeps it right as devices come and go. What
+	 * *is* persisted is only ever a name typed in settings.
+	 */
+	autoNameThisDevice(others) {
+		if (this.identity.named) return;
+		const derived = disambiguateDeviceName(
+			defaultDeviceName(),
+			freshBeacons(others, Date.now()),
+			this.identity.id
+		);
+		if (derived === this.identity.name) return;
+		this.identity.name = derived;
+	}
+
+	/**
+	 * Fill the paired-device fields from whichever beacon looks most useful.
+	 *
+	 * Writes to per-device storage, never through `saveSettings` — see the note
+	 * above `loadPairing` for why putting this in the vault would make the two
+	 * devices fight over it forever.
+	 */
+	autofillPairing(others) {
+		const result = applyPairingAutofill(this.pairing, others, Date.now());
+		if (!result.changed) return;
+		this.pairing = result.pairing;
+		savePairing(this.app, this.pairing);
+		this.refreshViews();
 	}
 
 	async writeOwnBeacon(fingerprint) {
@@ -1596,6 +3392,264 @@ class JemzSyncPlugin extends Plugin {
 			BEACON_DIR + '/device-' + this.identity.id + '.json',
 			JSON.stringify(beacon, null, 2)
 		);
+	}
+
+	/* ---------------------- GitHub ---------------------- */
+
+	/** A client for the connected account, or null when there is none. */
+	githubClient() {
+		if (!this.github.token) return null;
+		return githubClient(this.github.token, obsidianRequest);
+	}
+
+	/**
+	 * Check a token and remember who it belongs to.
+	 *
+	 * Nothing is stored until GitHub has confirmed the token works, so a
+	 * mistyped one cannot be saved and quietly fail later.
+	 */
+	async connectGithub(token) {
+		const client = githubClient(String(token || '').trim(), obsidianRequest);
+		const me = await client.whoami();
+		this.github.token = String(token || '').trim();
+		this.github.login = me.login;
+		saveGithubConfig(this.app, this.github);
+		return me;
+	}
+
+	disconnectGithub() {
+		this.github.token = '';
+		this.github.login = '';
+		this.github.repo = '';
+		this.github.lastCommit = '';
+		this.github.lastSyncAt = 0;
+		saveGithubConfig(this.app, this.github);
+		this.refreshViews();
+	}
+
+	/**
+	 * Work out what a push would do, without doing it.
+	 *
+	 * Used both for the preview and for the confirmation step, so that what
+	 * the user is shown and what actually happens come from the same code
+	 * rather than two descriptions that can drift apart.
+	 */
+
+	/**
+	 * Send the vault to the repository.
+	 *
+	 * @param {object} opts {force} — `force` here only means "the user has
+	 *   already confirmed a destructive change", never a Git force-push.
+	 */
+
+	/**
+	 * A full two-way sync with the repository.
+	 *
+	 * This is what makes GitHub a transport rather than a backup: edits made
+	 * here go up, edits made elsewhere come down, and anything both sides
+	 * touched is kept twice rather than resolved by guesswork.
+	 */
+	async syncWithGithub(opts) {
+		opts = opts || {};
+		const client = this.githubClient();
+		if (!client) throw new Error('Connect a GitHub account first.');
+		if (!this.github.repo) throw new Error('Choose a repository first.');
+		if (this.syncing) return { plan: null, applied: false, reason: 'already-running' };
+
+		this.syncing = true;
+		/*
+		 * Remembered so a failure is visible. Automatic syncing that fails
+		 * quietly is the worst possible behaviour: the panel goes on looking
+		 * healthy while nothing has left the device for days.
+		 */
+		this.lastSyncError = this.lastSyncError || null;
+		/*
+		 * Writing pulled files into the vault fires Obsidian's own change
+		 * events, which would schedule a scan, which would sync, which would
+		 * write... This is the same feedback loop the beacons already guard
+		 * against, and it gets the same treatment.
+		 */
+		this.applyingRemote = true;
+
+		const adapter = this.app.vault.adapter;
+		try {
+			const scan = await scanVault(adapter, this.settings);
+			this.syncAttemptedAt = Date.now();
+
+			assertScanComplete(scan);
+			const io = {
+				base: loadSyncBase(this.app),
+				listLocal: async () => {
+					const collected = await collectPushable(
+						async () => scan.entries.map((e) => ({ path: e.path, size: e.size })),
+						async (p) => new Uint8Array(await adapter.readBinary(p)),
+						{ notesOnly: this.github.notesOnly }
+					);
+					// Offloaded files exist but cannot be read; never deleted.
+					const unreadable = unreadableFromScan(scan);
+					for (let i = 0; i < unreadable.length; i++) {
+						collected.errors.push(unreadable[i]);
+					}
+					return collected;
+				},
+				readBytes: async (p) => new Uint8Array(await adapter.readBinary(p)),
+				writeBytes: async (p, bytes) => {
+					const dir = splitPath(p).dir;
+					if (dir) {
+						try {
+							if (!(await adapter.exists(dir))) await adapter.mkdir(dir);
+						} catch (_) {
+							/* raced with another writer; it exists either way */
+						}
+					}
+					await adapter.writeBinary(p, bytes.buffer.slice(
+						bytes.byteOffset,
+						bytes.byteOffset + bytes.byteLength
+					));
+				},
+				trash: (p) => trashPath(this.app, adapter, p),
+				saveBase: async (base, commit) => {
+					saveSyncBase(this.app, base);
+					this.github.lastCommit = commit || '';
+					this.github.lastSyncAt = Date.now();
+					saveGithubConfig(this.app, this.github);
+				},
+			};
+
+			const result = await githubSync(
+				client,
+				this.github.repo,
+				this.github.branch,
+				io,
+				{
+					dryRun: opts.dryRun,
+					onProgress: opts.onProgress,
+					message: 'jemzsync: ' + this.identity.name,
+					lastCommit: this.github.lastCommit,
+					confirmed: !!opts.confirmed,
+					confirmedBulkDelete: !!opts.confirmed,
+				}
+			);
+			this.lastSyncError = null;
+			return result;
+		} finally {
+			this.syncing = false;
+			// Give Obsidian's watcher a moment to deliver the events caused by
+			// our own writes before listening to it again.
+			window.setTimeout(() => {
+				this.applyingRemote = false;
+				/*
+				 * An edit you made while a sync happened to be running is a
+				 * real edit. Suppressing the loop must not swallow it — before
+				 * this, such an edit fell out of the fast path entirely and sat
+				 * unsent until the next poll, minutes later.
+				 */
+				if (this.syncWanted) {
+					this.syncWanted = false;
+					this.scheduleGithubSync();
+				}
+			}, 2000);
+			this.refreshViews();
+		}
+	}
+
+	/**
+	 * Keep the repository up to date without being asked.
+	 *
+	 * GitHub cannot notify a plugin that something changed, so "live" here
+	 * means two things: send within seconds of you stopping typing, and check
+	 * for other devices' work on a timer. The send is immediate because that
+	 * is the half that loses data if it is late.
+	 */
+	startGithubAutoSync() {
+		if (!storageUsesGithub(this.github.mode)) return;
+
+		const minutes = Math.max(1, Number(this.settings.githubPullMinutes) || 5);
+		this.registerInterval(
+			window.setInterval(() => {
+				if (!this.github.token || !this.github.repo) return;
+				this.autoSync();
+			}, minutes * 60 * 1000)
+		);
+
+		this.app.workspace.onLayoutReady(() => {
+			if (!this.github.token || !this.github.repo) return;
+			this.autoSync();
+		});
+	}
+
+	/** Debounced push after local edits settle. */
+	/**
+	 * Run a sync, recover from the one failure that is expected, and make
+	 * anything else visible.
+	 *
+	 * A 422 means another device committed between reading the branch and
+	 * writing it. That is not an error so much as an instruction: re-read and
+	 * merge. Refusing to force-push and then giving up would leave the two
+	 * devices stuck apart forever, which is the opposite of the point.
+	 */
+	autoSync(retriesLeft) {
+		const retries = retriesLeft === undefined ? 1 : retriesLeft;
+		return this.syncWithGithub({})
+			.then((r) => {
+				if (r && r.reason === 'already-running') this.scheduleGithubSync();
+				if (r && r.reason === 'needs-confirmation') {
+					/*
+					 * Automatic means automatic for additions, not for
+					 * deletions. Something that would overwrite or remove your
+					 * work waits for you to look at it.
+					 */
+					this.pendingPlan = r.plan;
+					if (!this.pendingNoticeShown) {
+						this.pendingNoticeShown = true;
+						new Notice(
+							'jemzsync: ' +
+								describeSyncPlan(r.plan) +
+								'. Open the jemzsync panel and press Sync now to review it.'
+						);
+					}
+					this.refreshViews();
+				} else {
+					this.pendingPlan = null;
+					this.pendingNoticeShown = false;
+				}
+				return r;
+			})
+			.catch((err) => {
+				const message = String((err && err.message) || err);
+
+				// The race: re-read the branch and merge, rather than stopping.
+				if (err && err.status === 422 && retries > 0) {
+					return new Promise((resolve) => {
+						window.setTimeout(() => resolve(this.autoSync(retries - 1)), 1500);
+					});
+				}
+
+				const first = this.lastSyncError !== message;
+				this.lastSyncError = message;
+				this.lastSyncErrorAt = Date.now();
+				// Once per distinct problem, so a broken token is noticed but a
+				// flaky connection does not produce a stream of popups.
+				if (first) new Notice('jemzsync could not sync with GitHub: ' + message);
+				this.refreshViews();
+			});
+	}
+
+	scheduleGithubSync() {
+		if (!storageUsesGithub(this.github.mode)) return;
+		if (!this.settings.githubAutoSync) return;
+		if (!this.github.token || !this.github.repo) return;
+		// Mid-sync, the change is remembered rather than dropped.
+		if (this.applyingRemote || this.syncing) {
+			this.syncWanted = true;
+			return;
+		}
+
+		if (this.githubTimer) window.clearTimeout(this.githubTimer);
+		this.githubTimer = window.setTimeout(() => {
+			this.githubTimer = null;
+			this.autoSync();
+		}, GITHUB_SYNC_DEBOUNCE_MS);
 	}
 
 	/** Keep the newest version of a conflicted file and trash the rest. */
@@ -1780,6 +3834,251 @@ class SetupModal extends Modal {
 	}
 }
 
+/* ---------------------- GitHub modals ---------------------- */
+
+/**
+ * The "i" beside each credential field.
+ *
+ * Two topics, because two questions get asked. The SSH one exists precisely
+ * because there is no SSH field: "where do I put my key?" is the reasonable
+ * first assumption for anyone used to `git push`, and answering it in the
+ * plugin is better than leaving someone hunting for a box that cannot exist.
+ */
+const HELP_TOPICS = {
+	token: {
+		title: 'How to create a GitHub access token',
+		intro:
+			'jemzsync talks to GitHub over its REST API, which authenticates with a personal access token sent in an HTTP header.',
+		steps: [
+			'On github.com, open Settings → Developer settings → Personal access tokens.',
+			'Choose "Fine-grained tokens" → Generate new token.',
+			'Under "Repository access", pick "Only select repositories" and choose the one repository holding your vault.',
+			'Under "Repository permissions", set Contents to "Read and write". That is the only permission jemzsync needs.',
+			'Metadata is set to Read automatically — leave it.',
+			'Generate the token, copy it, and paste it into the field here. GitHub shows it once.',
+		],
+		tableTitle: 'Permissions to grant',
+		table: [
+			['Contents', 'Read and write', 'reading and committing your notes — the only one required'],
+			['Metadata', 'Read (automatic)', 'looking up the repository and its default branch'],
+		],
+		notes: [
+			'A classic token works too, but it needs the whole "repo" scope, which grants access to every repository you own. A fine-grained token limited to one repository is much safer for notes.',
+			'Never grant admin, delete_repo, or workflow. jemzsync neither needs nor uses them.',
+			'The token is stored on this device only. It is never written into the vault and never committed to the repository.',
+			'If a token is ever exposed, revoke it at Settings → Developer settings and generate a new one. Revoking takes effect immediately.',
+		],
+	},
+	fingerprint: {
+		title: 'How to get another device\'s fingerprint',
+		intro:
+			'Usually you do not have to. Every device running jemzsync in this vault announces its own fingerprint, and this field fills itself in — that is what "Filled in automatically" means when it appears under the field. These are the ways to fetch one by hand.',
+		steps: [
+			'On the other device, open the jemzsync panel — the cloud icon in the left ribbon on a computer, or the ribbon in the sidebar on a phone or tablet.',
+			'Find the "Vault fingerprint" card and press Copy. A digest looks like a1b2c3d4-e5f6a7b8.',
+			'Or run "Copy vault fingerprint" from the command palette. That works identically on every platform, which makes it the easier route on a phone.',
+			'Send it across however you like, and paste it here. Anything you type into this field is yours and is never overwritten.',
+		],
+		tableTitle: 'Where to find it on each kind of device',
+		table: [
+			['Computer', 'cloud icon in the left ribbon, or the command palette'],
+			['Phone or tablet', 'open the left sidebar, then the jemzsync ribbon icon; or use the command palette'],
+			['Any platform', 'command palette → "Copy vault fingerprint"'],
+		],
+		notes: [
+			'Both devices need to have scanned recently for the comparison to mean anything: a digest describes the files as they were at the moment of that scan.',
+			'Matching digests mean both devices hold the same files at the same sizes. Modification times are deliberately excluded, because clouds restamp files for reasons that have nothing to do with content.',
+			'Per-device clutter is excluded too — pane layout, .DS_Store, the announcements themselves and jemzsync\'s own files — so two correctly synced devices are not reported as differing.',
+			'If this field stays empty, no other device has announced itself yet. Check that jemzsync is enabled there and that "Announce this device" is switched on.',
+			'Clearing the field hands it back to automatic detection.',
+		],
+	},
+	ssh: {
+		title: 'Why there is no SSH key field',
+		intro:
+			'If you are used to "git push", expecting an SSH key here is reasonable — but an SSH key cannot authenticate what this plugin does, on any platform.',
+		steps: [
+			'SSH authenticates the git command line, which opens a raw TCP connection to github.com on port 22.',
+			'An Obsidian plugin is JavaScript in a sandbox. It is given exactly two network functions, request and requestUrl, and both speak HTTPS only.',
+			'There is no socket API to open, so there is nothing for an SSH key to authenticate — and on phones and tablets there never will be.',
+			'GitHub\'s REST API, which is what jemzsync uses instead, takes a token in a header and does not accept SSH keys at all.',
+		],
+		table: [],
+		notes: [
+			'Your SSH keys still work perfectly for git on the command line. Nothing here changes that, and jemzsync never reads them.',
+			'A private key should never be pasted into an application in any case. Use an access token, which you can scope to a single repository and revoke on its own.',
+		],
+	},
+};
+
+class HelpModal extends Modal {
+	constructor(app, topic) {
+		super(app);
+		this.topic = topic;
+	}
+
+	onOpen() {
+		const help = HELP_TOPICS[this.topic] || HELP_TOPICS.token;
+		const el = this.contentEl;
+		el.empty();
+		el.addClass('jemzsync-modal');
+
+		el.createEl('h2', { text: help.title });
+		el.createEl('p', { cls: 'jemzsync-modal-detail', text: help.intro });
+
+		const ol = el.createEl('ol', { cls: 'jemzsync-fixes' });
+		for (let i = 0; i < help.steps.length; i++) {
+			ol.createEl('li', { text: help.steps[i] });
+		}
+
+		if (help.table && help.table.length) {
+			el.createEl('div', { cls: 'jemzsync-card-title', text: help.tableTitle || 'Details' });
+			const list = el.createEl('ul', { cls: 'jemzsync-list' });
+			for (let i = 0; i < help.table.length; i++) {
+				list.createEl('li', { text: help.table[i].join(' — ') });
+			}
+		}
+
+		el.createEl('div', { cls: 'jemzsync-card-title', text: 'Worth knowing' });
+		const notes = el.createEl('ul', { cls: 'jemzsync-list' });
+		for (let i = 0; i < help.notes.length; i++) {
+			notes.createEl('li', { text: help.notes[i] });
+		}
+
+		const row = el.createDiv({ cls: 'jemzsync-actions' });
+		row.createEl('button', { text: 'Close' }).addEventListener('click', () => this.close());
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+/** Pick a repository from the account's own, private ones included. */
+class RepoPickerModal extends Modal {
+	constructor(app, repos, onPick) {
+		super(app);
+		this.repos = repos || [];
+		this.onPick = onPick;
+	}
+
+	onOpen() {
+		const el = this.contentEl;
+		el.empty();
+		el.addClass('jemzsync-modal');
+		el.createEl('h2', { text: 'Choose a repository' });
+
+		if (!this.repos.length) {
+			el.createEl('p', {
+				cls: 'jemzsync-modal-detail',
+				text: 'This account owns no repositories, or the token was not granted access to any. A fine-grained token only sees the repositories you selected when you created it.',
+			});
+			return;
+		}
+
+		el.createEl('p', {
+			cls: 'jemzsync-modal-detail',
+			text: 'A private repository is the right choice for notes. Every device has to point at the same one.',
+		});
+
+		const list = el.createDiv({ cls: 'jemzsync-repo-list' });
+		for (let i = 0; i < this.repos.length; i++) {
+			const r = this.repos[i];
+			const row = list.createDiv({ cls: 'jemzsync-repo' });
+			row.createEl('div', {
+				cls: 'jemzsync-repo-name',
+				text: r.full + (r.private ? '  · private' : '  · public'),
+			});
+			row.createEl('div', {
+				cls: 'jemzsync-device-meta',
+				/*
+				 * No "empty" label here. GitHub's `size` is in kilobytes and
+				 * updates lazily after a push, so a repository holding a real
+				 * vault reports 0 for a while — the picker was calling a
+				 * populated repository empty. An unreliable signal is worse
+				 * than none.
+				 */
+				text: 'branch ' + r.defaultBranch,
+			});
+			const btn = row.createEl('button', { text: 'Use this' });
+			btn.addEventListener('click', () => {
+				this.close();
+				this.onPick(r);
+			});
+		}
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+/**
+ * Show exactly what a push will do before it does it.
+ *
+ * Adding files needs no permission. Changing or removing them does — this
+ * is the last point at which a mistake is still cheap.
+ */
+/**
+ * Show exactly what a sync will do before it does it.
+ *
+ * Only appears when something would be overwritten or removed. Pure additions
+ * apply without interruption, because there is nothing to lose.
+ */
+class SyncConfirmModal extends Modal {
+	constructor(app, plan, repo, onConfirm) {
+		super(app);
+		this.plan = plan;
+		this.repo = repo;
+		this.onConfirm = onConfirm;
+	}
+
+	onOpen() {
+		const el = this.contentEl;
+		el.empty();
+		el.addClass('jemzsync-modal');
+		el.createEl('h2', { text: 'Apply these changes?' });
+		el.createEl('p', {
+			cls: 'jemzsync-modal-detail',
+			text: describeSyncPlan(this.plan) + ' · ' + this.repo,
+		});
+
+		const section = (title, items, render) => {
+			if (!items.length) return;
+			el.createEl('div', { cls: 'jemzsync-card-title', text: title });
+			const ul = el.createEl('ul', { cls: 'jemzsync-list' });
+			for (let i = 0; i < Math.min(15, items.length); i++) {
+				ul.createEl('li', { text: render(items[i]) });
+			}
+			if (items.length > 15) {
+				ul.createEl('li', { text: '…and ' + (items.length - 15) + ' more' });
+			}
+		};
+
+		section('Will be overwritten on this device', this.plan.pull, (f) => f.path);
+		section('Will be moved to this device\'s trash', this.plan.deleteLocal, (f) => f.path);
+		section('Will be sent to the repository', this.plan.push, (f) => f.path);
+		section('Will be removed from the repository', this.plan.deleteRemote, (f) => f.path);
+		section(
+			'Edited in both places — both versions will be kept',
+			this.plan.conflict,
+			(c) => c.path
+		);
+
+		const row = el.createDiv({ cls: 'jemzsync-actions' });
+		const go = row.createEl('button', { text: 'Apply' });
+		go.addEventListener('click', () => {
+			this.close();
+			this.onConfirm();
+		});
+		row.createEl('button', { text: 'Cancel' }).addEventListener('click', () => this.close());
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
 /* ---------------------- sidebar view ---------------------- */
 
 class JemzSyncView extends ItemView {
@@ -1836,12 +4135,16 @@ class JemzSyncView extends ItemView {
 		if (!scan) {
 			root.createEl('p', {
 				cls: 'jemzsync-empty',
-				text: 'Scan to check whether this vault is set up to sync across your Apple devices.',
+				text:
+					'Scan to check whether this vault is set up to sync across your devices through ' +
+					transportName(this.plugin.ecosystem) +
+					'.',
 			});
 			return;
 		}
 
 		this.renderLocation(root, scan);
+		this.renderGithub(root, scan);
 		this.renderDevices(root, scan);
 		this.renderFingerprint(root, scan);
 		this.renderPlaceholders(root, scan);
@@ -1872,9 +4175,15 @@ class JemzSyncView extends ItemView {
 		});
 
 		if (!devices.length) {
+			const eco = ecosystemInfo(this.plugin.ecosystem);
 			card.createEl('p', {
 				cls: 'jemzsync-card-body',
-				text: 'No other devices seen yet. Enable jemzsync in this same vault on your iPhone or iPad — each device announces itself through iCloud and appears here on its own. The announcement travelling across is itself proof that sync is flowing.',
+				text:
+					'No other devices seen yet. Enable jemzsync in this same vault on your ' +
+					eco.otherDevice +
+					' — each device announces itself through ' +
+					transportName(this.plugin.ecosystem) +
+					' and appears here on its own. The announcement travelling across is itself proof that sync is flowing.',
 			});
 			return;
 		}
@@ -1901,6 +4210,104 @@ class JemzSyncView extends ItemView {
 					: d.stale
 					? 'Last known state differed, but this device has been quiet — open Obsidian there to refresh.'
 					: d.summary,
+			});
+		}
+	}
+
+	/**
+	 * The GitHub card. Absent entirely unless the vault is set to use it, so
+	 * that anyone who never turns it on sees the panel they always saw.
+	 */
+	renderGithub(root, scan) {
+		const cfg = this.plugin.github;
+		if (!storageUsesGithub(cfg.mode)) return;
+
+		const health = this.plugin.lastSyncError
+			? {
+					ok: false,
+					title: 'GitHub sync is failing',
+					detail: this.plugin.lastSyncError,
+			  }
+			: scan.githubHealth || classifyGithubHealth(cfg, Date.now());
+		const card = root.createDiv({
+			cls: 'jemzsync-card ' + (health.ok ? 'is-ok' : 'is-warn'),
+		});
+		card.createEl('div', { cls: 'jemzsync-card-title', text: health.title || 'GitHub' });
+		if (health.detail) {
+			card.createEl('p', { cls: 'jemzsync-card-body', text: health.detail });
+		}
+
+		if (!cfg.token || !cfg.repo) {
+			card.createEl('p', {
+				cls: 'jemzsync-card-body',
+				text: 'Open Settings → jemzsync to finish setting this up.',
+			});
+			return;
+		}
+
+		if (this.plugin.pendingPlan) {
+			card.createEl('div', {
+				cls: 'jemzsync-compare is-warn',
+				text:
+					'Waiting for you: ' +
+					describeSyncPlan(this.plugin.pendingPlan) +
+					'. Nothing has been changed yet — press Sync now to review it.',
+			});
+		}
+
+		const row = card.createDiv({ cls: 'jemzsync-actions' });
+		const sync = row.createEl('button', { text: 'Sync now' });
+		sync.addEventListener('click', async () => {
+			sync.disabled = true;
+			sync.setText('Checking…');
+			try {
+				let res = await this.plugin.syncWithGithub({
+					onProgress: (n, total) => sync.setText('Sending ' + n + '/' + total + '…'),
+				});
+
+				// Anything destructive stops here and shows what it would do.
+				if (!res.applied && res.reason === 'needs-confirmation') {
+					new SyncConfirmModal(this.plugin.app, res.plan, cfg.repo, () => {
+						this.plugin
+							.syncWithGithub({ confirmed: true })
+							.then((r) => {
+								new Notice(r.applied ? describeSyncPlan(r.plan) + '.' : 'Nothing to do.');
+								return this.plugin.runScan(false);
+							})
+							.then(() => this.render())
+							.catch((e) => new Notice(String((e && e.message) || e)));
+					}).open();
+					return;
+				}
+
+				if (!res.applied && res.reason === 'in-sync') {
+					new Notice('Already in sync with ' + cfg.repo + '.');
+				} else if (res.applied) {
+					new Notice(describeSyncPlan(res.plan) + '.');
+					if (res.plan.conflict.length) {
+						new Notice(
+							res.plan.conflict.length +
+								' file(s) were edited in both places. Both versions were kept — see the conflicts card.'
+						);
+					}
+					await this.plugin.runScan(false);
+				}
+				this.render();
+			} catch (err) {
+				new Notice(String((err && err.message) || err));
+			} finally {
+				sync.disabled = false;
+				sync.setText('Sync now');
+			}
+		});
+
+		if (this.plugin.settings.githubAutoSync) {
+			card.createEl('div', {
+				cls: 'jemzsync-meta',
+				text:
+					'Sending automatically after edits · checking every ' +
+					this.plugin.settings.githubPullMinutes +
+					' min',
 			});
 		}
 	}
@@ -1976,15 +4383,30 @@ class JemzSyncView extends ItemView {
 			await copyToClipboard(fp.digest, 'Fingerprint copied.');
 		});
 
-		const saved = this.plugin.settings.pairedFingerprint;
-		if (saved) {
-			const cmp = compareFingerprints({ digest: saved, files: fp.files }, fp);
+		const paired = this.plugin.pairing;
+		if (paired.fingerprint) {
+			/*
+			 * This used to pass the *local* file count as the remote one, so a
+			 * mismatch always reported "same file count, so some file differs
+			 * in size" — usually untrue. Auto-fill records the real counts off
+			 * the beacon, and a hand-typed digest has none, in which case the
+			 * comparison stays honest by reporting only that they differ.
+			 */
+			const remote = { digest: paired.fingerprint, files: paired.files || 0 };
+			const cmp = paired.files
+				? compareFingerprints(remote, fp, transportName(this.plugin.ecosystem))
+				: {
+						match: remote.digest === fp.digest,
+						summary:
+							remote.digest === fp.digest
+								? 'Match. That device holds the same files as this one.'
+								: 'No match — the two devices are holding different files. Wait a few minutes for ' +
+								  transportName(this.plugin.ecosystem) +
+								  ', then scan again.',
+				  };
 			card.createEl('div', {
 				cls: 'jemzsync-compare ' + (cmp.match ? 'is-ok' : 'is-warn'),
-				text:
-					(this.plugin.settings.pairedDeviceLabel || 'Other device') +
-					': ' +
-					cmp.summary,
+				text: (paired.label || 'Other device') + ': ' + cmp.summary,
 			});
 		}
 	}
@@ -1996,9 +4418,22 @@ class JemzSyncView extends ItemView {
 			cls: 'jemzsync-card-title',
 			text: scan.placeholders.length + ' files are not downloaded',
 		});
+		/*
+		 * A `.icloud` stub is always iCloud's doing, so naming iCloud here is
+		 * correct — but the device looking at it is not always a Mac. iCloud
+		 * for Windows produces exactly these files, and that user was being
+		 * told to open Finder.
+		 */
+		const eco = ecosystemInfo(this.plugin.ecosystem);
 		card.createEl('p', {
 			cls: 'jemzsync-card-body',
-			text: 'iCloud offloaded these to save space, so Obsidian cannot read them. In Finder, right-click the Obsidian folder in iCloud Drive and choose "Keep Downloaded". On iPhone, open the vault folder in Files and pull down to download.',
+			text:
+				'iCloud offloaded these to save space, so Obsidian cannot read them. In ' +
+				eco.fileManager +
+				', right-click the Obsidian folder in iCloud Drive and choose "Keep Downloaded".' +
+				(this.plugin.ecosystem === 'apple'
+					? ' On iPhone, open the vault folder in Files and pull down to download.'
+					: ''),
 		});
 		const list = card.createEl('ul', { cls: 'jemzsync-list' });
 		for (let i = 0; i < Math.min(10, scan.placeholders.length); i++) {
@@ -2017,17 +4452,24 @@ class JemzSyncView extends ItemView {
 				: 'No conflicts',
 		});
 
+		/*
+		 * Deliberately neutral. CONFLICT_PATTERNS also matches Dropbox's
+		 * "conflicted copy" and Syncthing's .sync-conflict- markers, so this
+		 * card fires for providers that have nothing to do with iCloud — and
+		 * naming the ecosystem's cloud instead would be just as wrong for a
+		 * Windows user whose vault is in Dropbox.
+		 */
 		if (!scan.conflicts.length) {
 			card.createEl('p', {
 				cls: 'jemzsync-card-body',
-				text: 'iCloud has not left duplicate copies behind.',
+				text: 'No duplicate copies have been left behind.',
 			});
 			return;
 		}
 
 		card.createEl('p', {
 			cls: 'jemzsync-card-body',
-			text: 'iCloud makes a second copy when two devices edit a note before seeing each other. Pick which version survives.',
+			text: 'A sync engine makes a second copy when two devices edit a note before seeing each other. Pick which version survives.',
 		});
 
 		for (let i = 0; i < scan.conflicts.length; i++) {
@@ -2076,6 +4518,15 @@ class JemzSyncSettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 
+		/*
+		 * Where the vault lives comes first. It is the choice that decides
+		 * what every other setting here even means — and it was previously
+		 * below eight toggles, where nobody would find it.
+		 */
+		this.displayStorage(containerEl);
+
+		containerEl.createEl('h3', { text: 'Devices and scanning' });
+
 		new Setting(containerEl)
 			.setName('This device\'s name')
 			.setDesc(
@@ -2086,9 +4537,12 @@ class JemzSyncSettingTab extends PluginSettingTab {
 					.setPlaceholder(defaultDeviceName())
 					.setValue(this.plugin.identity.name)
 					.onChange((v) => {
-						const name = v.trim() || defaultDeviceName();
-						this.plugin.identity.name = name;
-						saveDeviceName(this.plugin.app, name);
+						const chosen = v.trim();
+						this.plugin.identity.name = chosen || defaultDeviceName();
+						// Emptying the field hands naming back to the plugin,
+						// which will then keep it distinct from the others.
+						this.plugin.identity.named = !!chosen;
+						saveDeviceName(this.plugin.app, chosen);
 						this.plugin.refreshViews();
 					})
 			);
@@ -2175,35 +4629,307 @@ class JemzSyncSettingTab extends PluginSettingTab {
 				})
 			);
 
+		this.displayPairing(containerEl);
+	}
+
+	/**
+	 * Where the vault is kept.
+	 *
+	 * Presented as one choice with plain descriptions rather than a pile of
+	 * toggles, because the three options genuinely are alternatives and the
+	 * consequence of each is what matters.
+	 */
+	displayStorage(containerEl) {
+		const cfg = this.plugin.github;
+		const eco = ecosystemInfo(this.plugin.ecosystem);
+
+		containerEl.createEl('h3', { text: 'Where this vault is stored' });
+
+		const current = STORAGE_MODES.filter((m) => m.id === cfg.mode)[0] || STORAGE_MODES[0];
+		containerEl.createEl('p', { cls: 'jemzsync-card-body', text: current.blurb(eco) });
+
 		new Setting(containerEl)
-			.setName('Other device fingerprint')
+			.setName('Storage')
 			.setDesc(
-				'Paste the fingerprint from your iPhone or iPad here to compare it against this vault.'
+				'Your devices are on ' +
+					eco.label +
+					', so the cloud here means ' +
+					eco.cloud +
+					'. Choose GitHub if your devices are not all in the same ecosystem.'
+			)
+			.addDropdown((d) => {
+				for (let i = 0; i < STORAGE_MODES.length; i++) {
+					d.addOption(STORAGE_MODES[i].id, STORAGE_MODES[i].label(eco));
+				}
+				d.setValue(cfg.mode).onChange(async (v) => {
+					cfg.mode = v;
+					saveGithubConfig(this.plugin.app, cfg);
+					await this.plugin.runScan(false);
+					this.display();
+				});
+			});
+
+		if (!storageUsesGithub(cfg.mode)) return;
+
+		/* ---- GitHub account ---- */
+
+		if (!cfg.token) {
+			new Setting(containerEl)
+				.setName('GitHub access token')
+				.setDesc(
+					'A fine-grained personal access token with Contents: read and write on the repository you want to use. GitHub\'s API authenticates with a token, not an SSH key — SSH is for the git command line, which a plugin cannot run on a phone. The token is kept on this device only: never in the vault, and never in the repository.'
+				)
+				.addText((t) => {
+					/*
+					 * Masked by default, with an eye to reveal. A credential
+					 * typed in a settings pane is visible to anyone standing
+					 * behind you and to any screen recording, so hiding it is
+					 * the default and showing it is the deliberate act.
+					 */
+					t.setPlaceholder('github_pat_…').onChange((v) => {
+						this.pendingToken = v.trim();
+					});
+					if (t.inputEl) {
+						t.inputEl.type = 'password';
+						this.pendingTokenEl = t.inputEl;
+					}
+				})
+				.addExtraButton((b) =>
+					b
+						.setIcon('eye')
+						.setTooltip('Show the token')
+						.onClick(() => {
+							const el = this.pendingTokenEl;
+							if (!el) return;
+							el.type = el.type === 'password' ? 'text' : 'password';
+						})
+				)
+				.addExtraButton((b) =>
+					b
+						.setIcon('info')
+						.setTooltip('How to create a token, and which permissions it needs')
+						.onClick(() => new HelpModal(this.app, 'token').open())
+				)
+				.addButton((b) =>
+					b.setButtonText('Connect').onClick(async () => {
+						try {
+							const me = await this.plugin.connectGithub(this.pendingToken || '');
+							new Notice('Connected to GitHub as ' + me.login + '.');
+							this.pendingToken = '';
+							this.display();
+						} catch (err) {
+							new Notice(String((err && err.message) || err));
+						}
+					})
+				);
+
+			return;
+		}
+
+		new Setting(containerEl)
+			.setName('GitHub account')
+			.setDesc('Connected as ' + cfg.login + ' · token ' + maskToken(cfg.token))
+			.addButton((b) =>
+				b.setButtonText('Disconnect').onClick(() => {
+					this.plugin.disconnectGithub();
+					new Notice('Disconnected. The token has been removed from this device.');
+					this.display();
+				})
+			);
+
+		/* ---- repository ---- */
+
+		new Setting(containerEl)
+			.setName('Repository')
+			.setDesc(
+				cfg.repo
+					? 'The vault is saved into ' + cfg.repo + '. Every device must point at this same repository.'
+					: 'Not chosen yet. Private repositories are listed too.'
 			)
 			.addText((t) =>
 				t
-					.setPlaceholder('a1b2c3d4-e5f6a7b8')
-					.setValue(this.plugin.settings.pairedFingerprint)
-					.onChange(async (v) => {
-						this.plugin.settings.pairedFingerprint = v.trim();
-						await this.plugin.saveSettings();
-						this.plugin.refreshViews();
+					.setPlaceholder('owner/repo')
+					.setValue(cfg.repo)
+					.onChange((v) => {
+						const ref = parseRepoRef(v);
+						cfg.repo = ref ? ref.full : '';
+						saveGithubConfig(this.plugin.app, cfg);
+					})
+			)
+			.addButton((b) =>
+				b.setButtonText('Choose…').onClick(async () => {
+					try {
+						const client = this.plugin.githubClient();
+						const repos = await client.listRepos();
+						new RepoPickerModal(this.app, repos, (chosen) => {
+							cfg.repo = chosen.full;
+							cfg.branch = chosen.defaultBranch || 'main';
+							saveGithubConfig(this.plugin.app, cfg);
+							this.display();
+						}).open();
+					} catch (err) {
+						new Notice(String((err && err.message) || err));
+					}
+				})
+			);
+
+		new Setting(containerEl)
+			.setName('Branch')
+			.setDesc('Which branch the vault is committed to.')
+			.addText((t) =>
+				t
+					.setPlaceholder('main')
+					.setValue(cfg.branch)
+					.onChange((v) => {
+						cfg.branch = v.trim() || 'main';
+						saveGithubConfig(this.plugin.app, cfg);
 					})
 			);
 
 		new Setting(containerEl)
-			.setName('Other device name')
-			.setDesc('A label so you remember which device that fingerprint came from.')
+			.setName('Keep in sync automatically')
+			.setDesc(
+				'Send changes a few seconds after you stop typing, and check for other devices\' work on a timer. GitHub cannot notify a plugin when something changes, so receiving is a poll rather than a push.'
+			)
+			.addToggle((t) =>
+				t.setValue(this.plugin.settings.githubAutoSync).onChange(async (v) => {
+					this.plugin.settings.githubAutoSync = v;
+					await this.plugin.saveSettings();
+				})
+			);
+
+		new Setting(containerEl)
+			.setName('Check GitHub every')
+			.setDesc('Minutes between checks for changes made on your other devices.')
 			.addText((t) =>
 				t
-					.setPlaceholder('iPhone')
-					.setValue(this.plugin.settings.pairedDeviceLabel)
+					.setPlaceholder('5')
+					.setValue(String(this.plugin.settings.githubPullMinutes))
 					.onChange(async (v) => {
-						this.plugin.settings.pairedDeviceLabel = v.trim();
+						const n = parseInt(v, 10);
+						this.plugin.settings.githubPullMinutes = isNaN(n) ? 5 : Math.max(1, n);
 						await this.plugin.saveSettings();
-						this.plugin.refreshViews();
 					})
 			);
+
+		new Setting(containerEl)
+			.setName('Notes only')
+			.setDesc(
+				'Leave off to include your Obsidian configuration — themes, snippets and plugins — so a new device comes up already set up. Other plugins\' data.json files are never sent either way, because they can hold API keys.'
+			)
+			.addToggle((t) =>
+				t.setValue(cfg.notesOnly).onChange((v) => {
+					cfg.notesOnly = v;
+					saveGithubConfig(this.plugin.app, cfg);
+				})
+			);
+	}
+
+	/**
+	 * The two paired-device fields.
+	 *
+	 * Both fill themselves in from the beacons your other devices write, and
+	 * both stay editable at all times — nothing here is ever disabled. Typing
+	 * in a field claims it; clearing a field hands it back to the plugin.
+	 */
+	displayPairing(containerEl) {
+		const eco = ecosystemInfo(this.plugin.ecosystem);
+		const p = this.plugin.pairing;
+
+		const sourceNote = (source) =>
+			source === 'auto'
+				? ' Filled in automatically — edit it and it stays as you leave it.'
+				: source === 'manual'
+				? ' You set this. Clear the field to let jemzsync fill it in again.'
+				: '';
+
+		new Setting(containerEl)
+			.setName('Other device fingerprint')
+			.setDesc(
+				'Detected automatically once another device running jemzsync appears in this vault. You can also paste one in from your ' +
+					eco.otherDevice +
+					'.' +
+					sourceNote(p.fingerprintSource)
+			)
+			.addText((t) =>
+				t
+					.setPlaceholder('a1b2c3d4-e5f6a7b8')
+					.setValue(p.fingerprint)
+					.onChange((v) => this.setPaired('fingerprint', v))
+			)
+			.addExtraButton((b) =>
+				b
+					.setIcon('refresh-cw')
+					.setTooltip('Detect again')
+					.onClick(() => this.redetectPairing())
+			)
+			.addExtraButton((b) =>
+				b
+					.setIcon('info')
+					.setTooltip('How to get a fingerprint from another device')
+					.onClick(() => new HelpModal(this.app, 'fingerprint').open())
+			);
+
+		new Setting(containerEl)
+			.setName('Other device name')
+			.setDesc(
+				'A label so you remember which device that fingerprint came from.' +
+					sourceNote(p.labelSource)
+			)
+			.addText((t) =>
+				t
+					.setPlaceholder(eco.deviceExample)
+					.setValue(p.label)
+					.onChange((v) => this.setPaired('label', v))
+			)
+			.addExtraButton((b) =>
+				b
+					.setIcon('refresh-cw')
+					.setTooltip('Detect again')
+					.onClick(() => this.redetectPairing())
+			);
+	}
+
+	/**
+	 * Record a hand-edited pairing field.
+	 *
+	 * Emptying a field resets its provenance rather than marking it manual, so
+	 * that clearing it is how you ask for auto-fill back.
+	 */
+	setPaired(which, raw) {
+		const value = String(raw || '').trim();
+		const p = this.plugin.pairing;
+		p[which] = value;
+		p[which + 'Source'] = value ? 'manual' : '';
+		if (which === 'fingerprint') {
+			// A digest typed by hand carries no file counts, and inventing
+			// them is what made the panel claim two differing vaults held the
+			// same number of files.
+			p.files = 0;
+			p.bytes = 0;
+		}
+		savePairing(this.plugin.app, p);
+		this.plugin.refreshViews();
+	}
+
+	/** Hand both fields back to the plugin and re-run detection now. */
+	async redetectPairing() {
+		this.plugin.pairing = {
+			fingerprint: '',
+			fingerprintSource: '',
+			label: '',
+			labelSource: '',
+			files: 0,
+			bytes: 0,
+		};
+		savePairing(this.plugin.app, this.plugin.pairing);
+		await this.plugin.runScan(false);
+		this.display();
+		new Notice(
+			this.plugin.pairing.fingerprint
+				? 'Paired with ' + (this.plugin.pairing.label || 'your other device') + '.'
+				: 'No other device has announced itself in this vault yet.'
+		);
 	}
 }
 
@@ -2225,6 +4951,49 @@ module.exports.__device = {
 	saveDeviceName: saveDeviceName,
 	loadDismissedWarning: loadDismissedWarning,
 	saveDismissedWarning: saveDismissedWarning,
+	loadPairing: loadPairing,
+	savePairing: savePairing,
+	applyPairingAutofill: applyPairingAutofill,
+	loadGithubConfig: loadGithubConfig,
+	saveGithubConfig: saveGithubConfig,
+	classifyGithubHealth: classifyGithubHealth,
+	loadSyncBase: loadSyncBase,
+	saveSyncBase: saveSyncBase,
+	maskToken: maskToken,
+	GITHUB_KEYS: GITHUB_KEYS,
+};
+
+/*
+ * The GitHub client and push engine. Both take their transport as an
+ * argument, so the tests drive them with an in-memory GitHub exactly as the
+ * scanner is driven by a fake adapter — the suite never touches the network.
+ */
+module.exports.__github = {
+	githubClient: githubClient,
+	trashPath: trashPath,
+	assertScanComplete: assertScanComplete,
+	unreadableFromScan: unreadableFromScan,
+	githubSync: githubSync,
+	collectPushable: collectPushable,
+	storageUsesGithub: storageUsesGithub,
+	storageUsesCloud: storageUsesCloud,
+	STORAGE_ECOSYSTEM: STORAGE_ECOSYSTEM,
+	STORAGE_GITHUB: STORAGE_GITHUB,
+	STORAGE_BOTH: STORAGE_BOTH,
+	STORAGE_MODES: STORAGE_MODES,
+};
+/*
+ * The panel and the settings tab, exposed for the same reason as the two
+ * above: so they can be driven by a test. Rendering them against a stand-in
+ * for Obsidian is the only way to catch a wrong API call or a hardcoded
+ * string without opening the app on five different machines.
+ */
+module.exports.__ui = {
+	JemzSyncView: JemzSyncView,
+	JemzSyncSettingTab: JemzSyncSettingTab,
+	SetupModal: SetupModal,
+	HelpModal: HelpModal,
+	HELP_TOPICS: HELP_TOPICS,
 };
 module.exports.VIEW_TYPE_JEMZSYNC = VIEW_TYPE_JEMZSYNC;
 module.exports.PLUGIN_ID = PLUGIN_ID;

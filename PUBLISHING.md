@@ -30,8 +30,8 @@ The automated review checks these:
 The workflow in `.github/workflows/release.yml` does this. Tag and push:
 
 ```bash
-git tag 1.2.1
-git push origin 1.2.1
+git tag 2.0.1
+git push origin 2.0.1
 ```
 
 That runs the test suite, verifies the tag equals the manifest version, and
@@ -40,7 +40,7 @@ as **individual assets**.
 
 Two rules the tag must follow:
 
-- Bare version, `1.2.1` — **not** `v1.2.1`
+- Bare version, `2.0.1` — **not** `v2.0.1`
 - Exactly equal to `version` in `manifest.json`
 
 Then open the Releases page and confirm the three files are attached
@@ -96,10 +96,20 @@ submission. A later release can be flagged even though the original passed.
       colours
 - [x] No sample-plugin code
 - [x] `LICENSE` (MIT) at root
-- [x] README states plainly that there is no network use, no telemetry and no
-      credential handling — a policy disclosure requirement
+- [x] README discloses network use (`api.github.com` only, opt-in), the account
+      requirement (GitHub storage only), and where the access token is stored —
+      all policy disclosure requirements. There is still no telemetry.
 - [x] `versions.json` maps plugin version to minimum app version
 - [x] Tests (`npm test`) and mutation verification (`npm run test:mutation`)
+- [x] No Node.js or Electron API anywhere, verified by grep — the plugin runs
+      unchanged on iOS and Android
+- [x] One network host only (`api.github.com`), reached solely through
+      Obsidian's own `requestUrl`, and never contacted until a token is entered
+- [x] The access token is stored through `app.saveLocalStorage`, never through
+      `saveData` — it must not enter the vault, which is replicated by iCloud
+      and committed to the repository
+- [x] The plugin never syncs its own files to the repository, so it cannot
+      distribute or update itself
 
 ## Worth deciding before you submit
 
