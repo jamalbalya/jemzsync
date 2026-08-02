@@ -198,6 +198,8 @@ Settings → jemzsync → **Where this vault is stored**. Three choices:
 | **Cloud and GitHub** | The cloud moves your notes between devices; GitHub additionally keeps a full history you can go back through. |
 | **GitHub only** | GitHub moves your notes. The vault can sit anywhere on disk. |
 
+**The choice is per device.** Each device decides how *it* stores this vault, because in GitHub mode there is no shared settings file to read the answer from until after the first sync. Setting one device to "cloud only" does not stop another from syncing to GitHub — change it on every device you want changed.
+
 **GitHub only is the answer to a vault spanning ecosystems.** A Mac and a Windows PC have no good shared consumer cloud — iCloud on Windows can duplicate files, and Google Drive on Android needs a second app. A Git repository works identically on all of them.
 
 ### Keeping in sync
@@ -320,9 +322,9 @@ cd jemzsync
 npm test
 ```
 
-325 tests, no dependencies, no build step. The suite covers vault-location detection, the migration plan, conflict grouping and resolution, fingerprinting, device beacons, pairing auto-fill, device naming, ecosystem-neutral wording, and the scanner driven by a fake adapter — including end-to-end simulations of a Mac beacon being read on an iPhone for both the matching and the missing-note case.
+327 tests, no dependencies, no build step. The suite covers vault-location detection, the migration plan, conflict grouping and resolution, fingerprinting, device beacons, pairing auto-fill, device naming, ecosystem-neutral wording, and the scanner driven by a fake adapter — including end-to-end simulations of a Mac beacon being read on an iPhone for both the matching and the missing-note case.
 
-The suite is itself verified by mutation testing (`npm run test:mutation`): 76 deliberate regressions are injected into a temporary copy of the source and all 76 must be caught — including an infinite-loop hang, an auto-filled field overwriting something you typed, Apple wording creeping back into a screen every platform sees, a force-push that would erase another device, an offloaded file being mistaken for a deleted one, and a delete falling back to a permanent removal instead of the trash.
+The suite is itself verified by mutation testing (`npm run test:mutation`): 77 deliberate regressions are injected into a temporary copy of the source and all 77 must be caught — including an infinite-loop hang, an auto-filled field overwriting something you typed, Apple wording creeping back into a screen every platform sees, a force-push that would erase another device, an offloaded file being mistaken for a deleted one, and a delete falling back to a permanent removal instead of the trash.
 
 Layout:
 

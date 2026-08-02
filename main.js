@@ -3561,19 +3561,35 @@ class JemzSyncPlugin extends Plugin {
 	 * for other devices' work on a timer. The send is immediate because that
 	 * is the half that loses data if it is late.
 	 */
-	startGithubAutoSync() {
-		if (!storageUsesGithub(this.github.mode)) return;
+	/**
+	 * Is GitHub syncing switched on, right now?
+	 *
+	 * Asked afresh every time rather than once at startup. The storage mode is
+	 * a setting the user changes mid-session, and reading it only when the
+	 * timer was created meant a vault switched to cloud-only carried on
+	 * committing to GitHub until Obsidian restarted — and one switched the
+	 * other way never started at all.
+	 */
+	githubReady() {
+		return (
+			storageUsesGithub(this.github.mode) &&
+			!!this.github.token &&
+			!!this.github.repo
+		);
+	}
 
+	startGithubAutoSync() {
+		// Registered unconditionally; the mode is checked when it fires.
 		const minutes = Math.max(1, Number(this.settings.githubPullMinutes) || 5);
 		this.registerInterval(
 			window.setInterval(() => {
-				if (!this.github.token || !this.github.repo) return;
+				if (!this.githubReady()) return;
 				this.autoSync();
 			}, minutes * 60 * 1000)
 		);
 
 		this.app.workspace.onLayoutReady(() => {
-			if (!this.github.token || !this.github.repo) return;
+			if (!this.githubReady()) return;
 			this.autoSync();
 		});
 	}
@@ -3636,9 +3652,8 @@ class JemzSyncPlugin extends Plugin {
 	}
 
 	scheduleGithubSync() {
-		if (!storageUsesGithub(this.github.mode)) return;
+		if (!this.githubReady()) return;
 		if (!this.settings.githubAutoSync) return;
-		if (!this.github.token || !this.github.repo) return;
 		// Mid-sync, the change is remembered rather than dropped.
 		if (this.applyingRemote || this.syncing) {
 			this.syncWanted = true;

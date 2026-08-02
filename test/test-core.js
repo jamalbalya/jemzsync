@@ -2712,6 +2712,38 @@ async function githubTests() {
 		delete global.window;
 	});
 
+	await test('switching to cloud-only stops GitHub syncing immediately', async () => {
+		// Found on the real vault: the mode was read once, when the timer was
+		// created. A vault switched to cloud-only carried on committing to
+		// GitHub until Obsidian restarted.
+		const t = pluginUnderTest();
+		assert.strictEqual(t.p.githubReady(), true, 'starts ready in github mode');
+		t.p.github.mode = 'ecosystem';
+		assert.strictEqual(
+			t.p.githubReady(),
+			false,
+			'the mode must be re-read, not remembered from startup'
+		);
+		t.reset();
+		t.p.scheduleGithubSync();
+		assert.strictEqual(t.scheduledCount(), 0, 'and nothing may be scheduled');
+		delete global.window;
+	});
+
+	await test('switching TO GitHub starts syncing without a restart', async () => {
+		// The same bug in the other direction: a vault that started in
+		// cloud-only mode never registered the timer at all.
+		const t = pluginUnderTest();
+		t.p.github.mode = 'ecosystem';
+		assert.strictEqual(t.p.githubReady(), false);
+		t.p.github.mode = 'both';
+		assert.strictEqual(t.p.githubReady(), true, 'must become ready at once');
+		t.reset();
+		t.p.scheduleGithubSync();
+		assert.ok(t.scheduledCount() > 0);
+		delete global.window;
+	});
+
 	await test('nothing is scheduled when GitHub is not the storage', async () => {
 		const t = pluginUnderTest();
 		t.p.github.mode = 'ecosystem';
