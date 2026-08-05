@@ -32,15 +32,12 @@ This one cost 2.0.1 its listing, so it is worth stating plainly.
 
 Obsidian's review reproduces the release from source and compares the result
 against the published asset. It runs `npm run build` to do that. With no
-`build` script it cannot even start, and the scorecard reports:
+`build` script it cannot even start, and 2.0.1's scorecard reported:
 
 ```
 HIGH  Release build could not be verified against the private source repository
 INFO  Build verification could not run because package.json has no build script
 INFO  Build verification not available.
-INFO  Malware scan not available.
-INFO  Obfuscation scan not available.
-INFO  Network requests scan not available.
 ```
 
 Two traps in that output:
@@ -50,9 +47,19 @@ Two traps in that output:
   was flagged this way while the repo was verifiably public, and a review
   request arguing the repo was public went nowhere, because being public was
   never the finding.
-- **The malware, obfuscation and network scans are downstream of build
-  verification.** They do not fail independently; they simply cannot run. Fix
-  the build script and all four clear at once.
+- **Signing attestations is what makes the script mandatory.** Verified against
+  four listed plugins: `quadro` and `sortable-tables` have no `build` script and
+  no attestations, and both pass — verification is simply *skipped*, one INFO
+  line, no penalty. `jemz-vault-assistant` has both, and reports "Build
+  reproduced the release main.js byte-for-byte". jemzsync 2.0.1 had attestations
+  but no `build` script, so verification was **attempted and failed**, which is
+  the HIGH. `release.yml` here signs provenance, so the script is not optional.
+
+Do not read anything into the other "scan not available" lines. Malware,
+obfuscation and network-request scans are unrelated to this, and still report
+"not available" on 2.0.2 with verification passing — `jemz-vault-assistant`
+shows the same. They are not downstream of the build, and fixing the build does
+not clear them.
 
 A plugin with no compiler still needs the script. `build.js` here copies
 `src/main.js` and stamps the version onto it. What matters is that the output
