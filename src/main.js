@@ -1,4 +1,3 @@
-/* jemzsync 2.0.2 — generated from src/main.js by build.js. Edit the source, not this file. */
 'use strict';
 
 /*

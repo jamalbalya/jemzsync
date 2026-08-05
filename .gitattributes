@@ -1,0 +1,4 @@
+# Obsidian's review reproduces the release from source and compares bytes, so a
+# Windows checkout must not rewrite LF to CRLF — that alone would fail the
+# comparison even though the source is identical.
+* text=auto eol=lf

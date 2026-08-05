@@ -24,17 +24,53 @@ The automated review checks these:
 - The `id` in `manifest.json` is unique across the directory and does not
   contain the word "obsidian" — check https://obsidian.md/plugins
 - No sample-plugin leftovers from `obsidian-sample-plugin`
+- **`package.json` has a `build` script.** Not optional. See below.
+
+## Step 1a — `package.json` must have a `build` script
+
+This one cost 2.0.1 its listing, so it is worth stating plainly.
+
+Obsidian's review reproduces the release from source and compares the result
+against the published asset. It runs `npm run build` to do that. With no
+`build` script it cannot even start, and the scorecard reports:
+
+```
+HIGH  Release build could not be verified against the private source repository
+INFO  Build verification could not run because package.json has no build script
+INFO  Build verification not available.
+INFO  Malware scan not available.
+INFO  Obfuscation scan not available.
+INFO  Network requests scan not available.
+```
+
+Two traps in that output:
+
+- **"private source repository" does not mean your repo is private.** It is the
+  canned wording for "could not verify the release build against source". 2.0.1
+  was flagged this way while the repo was verifiably public, and a review
+  request arguing the repo was public went nowhere, because being public was
+  never the finding.
+- **The malware, obfuscation and network scans are downstream of build
+  verification.** They do not fail independently; they simply cannot run. Fix
+  the build script and all four clear at once.
+
+A plugin with no compiler still needs the script. `build.js` here copies
+`src/main.js` and stamps the version onto it. What matters is that the output
+is deterministic — no timestamps, no build host, no filesystem ordering — so
+the reproduction is byte-identical. `npm run build:check` asserts exactly that,
+and the release workflow runs it before it will publish anything.
 
 ## Step 2 — Cut a release
 
 The workflow in `.github/workflows/release.yml` does this. Tag and push:
 
 ```bash
-git tag 2.0.1
-git push origin 2.0.1
+git tag 2.0.2
+git push origin 2.0.2
 ```
 
-That runs the test suite, verifies the tag equals the manifest version, and
+That proves `main.js` reproduces from `src/`, runs the test suite, verifies the
+tag equals the manifest version, and
 publishes a release with `main.js`, `manifest.json` and `styles.css` attached
 as **individual assets**.
 
@@ -99,7 +135,10 @@ submission. A later release can be flagged even though the original passed.
 - [x] README discloses network use (`api.github.com` only, opt-in), the account
       requirement (GitHub storage only), and where the access token is stored —
       all policy disclosure requirements. There is still no telemetry.
-- [x] `versions.json` maps plugin version to minimum app version
+- [x] `versions.json` maps plugin version to minimum app version, and every
+      entry in it corresponds to a real tag and release
+- [x] `package.json` has a `build` script, and `npm run build` is deterministic
+      so the release reproduces byte-for-byte from source
 - [x] Tests (`npm test`) and mutation verification (`npm run test:mutation`)
 - [x] No Node.js or Electron API anywhere, verified by grep — the plugin runs
       unchanged on iOS and Android

@@ -67,7 +67,7 @@ jemzsync detects all three.
 
 ## Install
 
-There is no build step. `main.js` is plain JavaScript that Obsidian loads directly, which is also why the same files work on iPhone and iPad where you cannot run a compiler.
+There is no compiler and no bundler. `main.js` is plain JavaScript that Obsidian loads directly, which is why the same files work on iPhone and iPad where you cannot run a build toolchain. The one build step, `npm run build`, copies `src/main.js` and stamps the version onto it — it needs nothing but Node, and the released `main.js` is committed so you can install straight from a download.
 
 ### On your Mac
 
@@ -322,22 +322,26 @@ cd jemzsync
 npm test
 ```
 
-327 tests, no dependencies, no build step. The suite covers vault-location detection, the migration plan, conflict grouping and resolution, fingerprinting, device beacons, pairing auto-fill, device naming, ecosystem-neutral wording, and the scanner driven by a fake adapter — including end-to-end simulations of a Mac beacon being read on an iPhone for both the matching and the missing-note case.
+327 tests and zero dependencies. The suite covers vault-location detection, the migration plan, conflict grouping and resolution, fingerprinting, device beacons, pairing auto-fill, device naming, ecosystem-neutral wording, and the scanner driven by a fake adapter — including end-to-end simulations of a Mac beacon being read on an iPhone for both the matching and the missing-note case.
 
 The suite is itself verified by mutation testing (`npm run test:mutation`): 77 deliberate regressions are injected into a temporary copy of the source and all 77 must be caught — including an infinite-loop hang, an auto-filled field overwriting something you typed, Apple wording creeping back into a screen every platform sees, a force-push that would erase another device, an offloaded file being mistaken for a deleted one, and a delete falling back to a permanent removal instead of the trash.
 
 Layout:
 
 ```
-main.js             plugin + core logic (no build step)
+src/main.js         plugin + core logic — the file you edit
+build.js            emits main.js from src/main.js, deterministically
+main.js             the built artifact Obsidian loads (committed, and released)
 manifest.json       plugin metadata
 styles.css          panel styling via Obsidian theme variables
 test/test-core.js   test suite
 test/mutation.js    mutation testing of the suite itself
-.github/workflows/  tag-triggered release pipeline (tests gate the release)
+.github/workflows/  tag-triggered release pipeline (build + tests gate the release)
 ```
 
-`main.js` splits into a pure core (no I/O, fully tested), a scanner using Obsidian's adapter, and the Obsidian integration. `module.exports.__core` exposes the core for testing.
+`src/main.js` splits into a pure core (no I/O, fully tested), a scanner using Obsidian's adapter, and the Obsidian integration. `module.exports.__core` exposes the core for testing.
+
+`npm run build` is a pure function of `src/main.js` and `manifest.json` — no timestamps, no build host — so anyone can check out a tag, run it, and get a `main.js` byte-identical to the released asset. `npm run build:check` asserts that without writing anything, and the release workflow runs it before publishing. That reproducibility is what Obsidian's automated build verification checks, alongside the [build provenance attestation](https://github.com/jamalbalya/jemzsync/attestations) the workflow signs for all three assets.
 
 Uses no Node.js or Electron APIs, so `isDesktopOnly` is `false` and it runs on iOS and iPadOS.
 

@@ -1,6 +1,6 @@
-# Tag a version (e.g. `git tag 1.3.1 && git push origin 1.3.1`) and this
-# workflow runs the test suite, then publishes a GitHub release with the
-# three files Obsidian needs as assets.
+# Tag a version (e.g. `git tag 2.0.2 && git push origin 2.0.2`) and this
+# workflow proves main.js reproduces from src/, runs the test suite, then
+# publishes a GitHub release with the three files Obsidian needs as assets.
 #
 # The tag must exactly equal the version in manifest.json, with no "v"
 # prefix — that is an Obsidian community-plugin requirement.
@@ -23,11 +23,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install (no dependencies, but proves the lockfile is sane)
+        run: npm ci
+
+      # Obsidian's review reproduces the release from source and compares it
+      # against the published asset. This proves the committed main.js is
+      # exactly what src/main.js builds, so that comparison cannot fail.
+      - name: Verify main.js reproduces from source
+        run: npm run build:check
+
       - name: Run test suite
-        run: node test/test-core.js
+        run: npm test
 
       - name: Verify the tests would catch a regression
-        run: node test/mutation.js
+        run: npm run test:mutation
 
       - name: Verify tag matches manifest version
         run: |
