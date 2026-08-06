@@ -1845,6 +1845,35 @@ async function scheduleTests() {
 		assert.strictEqual(C.parseLocalDateTime('2026-08-15 09:30'), null);
 	});
 
+	await test('a stored moment is read as a wall clock, never as UTC', () => {
+		/*
+		 * Run in a zone with a real offset, deliberately, rather than trusting
+		 * whatever the machine is set to. On a UTC machine — which is what CI
+		 * is — local time and UTC are the same thing, so parsing a bare
+		 * "2026-08-15T09:30" the wrong way looks identical to parsing it the
+		 * right way, and nothing here would notice. Forcing the zone is what
+		 * makes the distinction visible everywhere.
+		 */
+		const { execSync } = require('child_process');
+		const main = JSON.stringify(require.resolve('../main.js'));
+		const script =
+			'const C = require(' + main + ').__core;' +
+			'const d = C.parseLocalDateTime("2026-08-15T09:30");' +
+			'process.stdout.write(JSON.stringify([d.getHours(), d.getMinutes(), C.formatLocalDateTime(d)]));';
+
+		for (const zone of ['Asia/Jakarta', 'America/Los_Angeles', 'Asia/Kolkata']) {
+			const out = execSync(process.execPath + ' -e ' + JSON.stringify(script), {
+				env: Object.assign({}, process.env, { TZ: zone }),
+				encoding: 'utf8',
+			});
+			assert.deepStrictEqual(
+				JSON.parse(out),
+				[9, 30, '2026-08-15T09:30'],
+				'half past nine did not survive ' + zone
+			);
+		}
+	});
+
 	await test('a two-digit year is refused, not read as the 1900s', () => {
 		// new Date(26, 0, 1) means 1926, so this would parse to something that
 		// does not format back to the text it came from.
