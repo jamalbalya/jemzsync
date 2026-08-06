@@ -1,6 +1,6 @@
 {
   "name": "jemzsync",
-  "version": "2.0.2",
+  "version": "2.1.0",
   "description": "Detect your device's ecosystem, check the vault sits in a folder iCloud or Google Drive can sync, compare vaults across devices, and resolve sync conflicts.",
   "main": "main.js",
   "scripts": {

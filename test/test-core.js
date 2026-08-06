@@ -1603,6 +1603,967 @@ function fakeGitHub(opts) {
 
 const bytes = (s) => new TextEncoder().encode(s);
 
+/* ================= check schedule ================= */
+
+/**
+ * Every assertion here is built from local Date components rather than from
+ * epoch numbers or ISO strings, so the suite gives the same answer in London,
+ * Jakarta and Los Angeles. A schedule is a wall clock, and a test that only
+ * passed in UTC would be testing the wrong thing.
+ */
+async function scheduleTests() {
+	const at = (y, mo, d, h, mi) => new Date(y, mo, d, h || 0, mi || 0, 0, 0).getTime();
+	const MINUTE = 60 * 1000;
+	const DAY = 24 * 60 * MINUTE;
+
+	group('schedule — shape and upgrade');
+
+	await test('an empty schedule normalises to the shipped default', () => {
+		const s = C.normalizeSchedule(null);
+		assert.strictEqual(s.mode, 'minutes');
+		assert.strictEqual(s.every, 2);
+		assert.strictEqual(s.at, '');
+		// Everything loops by default; "just once" has to be asked for.
+		assert.strictEqual(s.repeat, 'monthly');
+	});
+
+	await test('a mode nobody recognises falls back rather than throwing', () => {
+		// data.json is a plain file a user can edit, and a downgrade can leave
+		// a mode this version has never heard of.
+		const s = C.normalizeSchedule({ mode: 'fortnightly', every: 3 });
+		assert.strictEqual(s.mode, 'minutes');
+		assert.strictEqual(s.every, 3);
+	});
+
+	await test('counts below one and above the unit\'s ceiling are clamped', () => {
+		assert.strictEqual(C.normalizeSchedule({ mode: 'hours', every: 0 }).every, 1);
+		assert.strictEqual(C.normalizeSchedule({ mode: 'hours', every: -7 }).every, 1);
+		assert.strictEqual(C.normalizeSchedule({ mode: 'minutes', every: 99999 }).every, 60 * 24);
+		assert.strictEqual(C.normalizeSchedule({ mode: 'weekly', every: 500 }).every, 52);
+		assert.strictEqual(C.normalizeSchedule({ mode: 'days', every: 2.9 }).every, 2);
+	});
+
+	await test('a date that is not a real date is not kept', () => {
+		assert.strictEqual(C.normalizeSchedule({ mode: 'datetime', at: 'soon' }).at, '');
+		assert.strictEqual(C.normalizeSchedule({ mode: 'datetime', at: '2026-02-30T09:00' }).at, '');
+		assert.strictEqual(
+			C.normalizeSchedule({ mode: 'datetime', at: '2026-08-15T09:30' }).at,
+			'2026-08-15T09:30'
+		);
+	});
+
+	await test('a chosen date survives switching to another kind of schedule', () => {
+		// Otherwise picking a date, glancing at "every 2 hours" and going back
+		// would silently discard it.
+		const s = C.normalizeSchedule({ mode: 'hours', every: 2, at: '2026-08-15T09:30' });
+		assert.strictEqual(s.at, '2026-08-15T09:30');
+	});
+
+	await test('the old "check every N minutes" box is carried across the upgrade', () => {
+		// The reported worry: someone who deliberately set 30 must not be
+		// reset to the default by installing a new version.
+		const s = C.scheduleFromSettings({ githubPullMinutes: 30 });
+		assert.strictEqual(s.mode, 'minutes');
+		assert.strictEqual(s.every, 30);
+	});
+
+	await test('a real schedule wins over the old box', () => {
+		const s = C.scheduleFromSettings({
+			githubPullMinutes: 30,
+			githubSchedule: { mode: 'days', every: 3 },
+		});
+		assert.strictEqual(s.mode, 'days');
+		assert.strictEqual(s.every, 3);
+	});
+
+	await test('a vault that never had either setting gets the default', () => {
+		assert.strictEqual(C.scheduleFromSettings({}).every, 2);
+		assert.strictEqual(C.scheduleFromSettings(null).mode, 'minutes');
+	});
+
+	await test('a schedule that does not say how to repeat still loops', () => {
+		// The rule the user asked for: whatever is chosen, the check keeps
+		// happening. Stopping has to be asked for by name.
+		assert.strictEqual(C.normalizeSchedule({ mode: 'datetime', at: '2026-08-15T09:30' }).repeat, 'monthly');
+		assert.strictEqual(C.normalizeSchedule({ mode: 'datetime', repeat: 'yearly' }).repeat, 'monthly');
+		assert.strictEqual(C.normalizeSchedule({ mode: 'datetime', repeat: 'once' }).repeat, 'once');
+	});
+
+	await test('an interval schedule repeats for ever, never stopping on its own', () => {
+		// Fifty rounds of each: there must never be a point where the next
+		// check is null.
+		for (const mode of ['minutes', 'hours', 'days', 'weekly', 'monthly']) {
+			let cursor = at(2026, 7, 5, 12, 0);
+			for (let i = 0; i < 50; i++) {
+				const next = C.nextRunAt({ mode: mode, every: 1 }, cursor, cursor + 1000);
+				assert.ok(next !== null, mode + ' stopped after ' + i + ' checks');
+				assert.ok(next > cursor, mode + ' did not move forward');
+				cursor = next;
+			}
+		}
+	});
+
+	await test('a calendar schedule repeats for ever too, unless told to stop once', () => {
+		for (const repeat of ['daily', 'weekly', 'monthly']) {
+			const s = { mode: 'datetime', at: '2026-08-15T09:30', repeat: repeat };
+			let cursor = at(2026, 7, 15, 9, 30);
+			for (let i = 0; i < 50; i++) {
+				const next = C.nextRunAt(s, cursor, cursor + 1000);
+				assert.ok(next !== null, repeat + ' stopped after ' + i + ' checks');
+				cursor = next;
+			}
+		}
+		const once = { mode: 'datetime', at: '2026-08-15T09:30', repeat: 'once' };
+		const kept = at(2026, 7, 15, 9, 30);
+		assert.strictEqual(C.nextRunAt(once, kept, kept + 1000), null);
+	});
+
+	group('schedule — the five intervals');
+
+	await test('each unit is the length it says it is', () => {
+		assert.strictEqual(C.schedulePeriodMs({ mode: 'minutes', every: 5 }), 5 * 60 * 1000);
+		assert.strictEqual(C.schedulePeriodMs({ mode: 'hours', every: 3 }), 3 * 60 * 60 * 1000);
+		assert.strictEqual(C.schedulePeriodMs({ mode: 'days', every: 1 }), 24 * 60 * 60 * 1000);
+		assert.strictEqual(C.schedulePeriodMs({ mode: 'weekly', every: 1 }), 7 * 24 * 60 * 60 * 1000);
+		assert.strictEqual(C.schedulePeriodMs({ mode: 'monthly', every: 1 }), 30 * 24 * 60 * 60 * 1000);
+		assert.strictEqual(C.schedulePeriodMs({ mode: 'datetime', at: '2026-08-15T09:30' }), 0);
+	});
+
+	await test('a vault that has never been checked is due immediately', () => {
+		const now = at(2026, 7, 5, 12, 0);
+		assert.strictEqual(C.nextRunAt({ mode: 'days', every: 7 }, 0, now), now);
+	});
+
+	await test('after a check, the next one is a full period later', () => {
+		const last = at(2026, 7, 5, 12, 0);
+		const next = C.nextRunAt({ mode: 'hours', every: 6 }, last, last + 1000);
+		assert.strictEqual(next, last + 6 * 60 * 60 * 1000);
+	});
+
+	await test('a check missed while the app was closed comes back overdue, not skipped', () => {
+		// The phone case: closed on Monday, opened on Friday. The answer has
+		// to be a time in the past so the plugin checks at once.
+		const last = at(2026, 7, 3, 9, 0);
+		const now = at(2026, 7, 7, 9, 0);
+		const next = C.nextRunAt({ mode: 'days', every: 1 }, last, now);
+		assert.ok(next < now, 'an overdue check must report as overdue');
+		assert.strictEqual(next, last + 24 * 60 * 60 * 1000);
+	});
+
+	group('schedule — the calendar');
+
+	await test('February is 28 days, or 29 when it should be', () => {
+		assert.strictEqual(C.daysInMonth(2026, 1), 28);
+		assert.strictEqual(C.daysInMonth(2024, 1), 29);
+		// The rule is not "every four years", and both exceptions matter.
+		assert.strictEqual(C.daysInMonth(1900, 1), 28);
+		assert.strictEqual(C.daysInMonth(2000, 1), 29);
+	});
+
+	await test('every other month is the length everyone expects', () => {
+		const lengths = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+		for (let m = 0; m < 12; m++) {
+			assert.strictEqual(C.daysInMonth(2026, m), lengths[m], 'month ' + m);
+		}
+	});
+
+	await test('the grid is always six whole weeks, Monday first', () => {
+		for (let m = 0; m < 12; m++) {
+			const g = C.buildMonthGrid(2026, m);
+			assert.strictEqual(g.weeks.length, 6, 'month ' + m + ' rows');
+			for (const week of g.weeks) assert.strictEqual(week.length, 7);
+		}
+	});
+
+	await test('August 2026 is drawn exactly as the calendar prints it', () => {
+		// The month in the screenshot: 1 August falls on a Saturday, so the
+		// first row runs 27 July to 2 August.
+		const g = C.buildMonthGrid(2026, 7);
+		assert.strictEqual(g.label, 'August 2026');
+		const first = g.weeks[0];
+		assert.deepStrictEqual(first.map((c) => c.day), [27, 28, 29, 30, 31, 1, 2]);
+		assert.deepStrictEqual(
+			first.map((c) => c.inMonth),
+			[false, false, false, false, false, true, true]
+		);
+		// Saturday and Sunday, and only those.
+		assert.deepStrictEqual(
+			first.map((c) => c.weekend),
+			[false, false, false, false, false, true, true]
+		);
+		// The last row of a 31-day month starting on a Saturday.
+		const last = g.weeks[5];
+		assert.strictEqual(last[0].day, 31);
+		assert.strictEqual(last[0].inMonth, true);
+		assert.strictEqual(last[1].day, 1);
+		assert.strictEqual(last[1].inMonth, false);
+	});
+
+	await test('a leap February shows the 29th and a common one does not', () => {
+		const leap = C.buildMonthGrid(2024, 1).weeks.reduce((a, w) => a.concat(w), []);
+		const inLeap = leap.filter((c) => c.inMonth).map((c) => c.day);
+		assert.strictEqual(inLeap.length, 29);
+		assert.strictEqual(inLeap[28], 29);
+
+		const common = C.buildMonthGrid(2026, 1).weeks.reduce((a, w) => a.concat(w), []);
+		assert.strictEqual(common.filter((c) => c.inMonth).length, 28);
+	});
+
+	await test('paging past December rolls the year over', () => {
+		assert.strictEqual(C.buildMonthGrid(2026, 12).label, 'January 2027');
+		assert.strictEqual(C.buildMonthGrid(2026, -1).label, 'December 2025');
+	});
+
+	await test('today is marked, and only today', () => {
+		const today = at(2026, 7, 15, 13, 45);
+		const cells = C.buildMonthGrid(2026, 7, today).weeks.reduce((a, w) => a.concat(w), []);
+		const marked = cells.filter((c) => c.today);
+		assert.strictEqual(marked.length, 1);
+		assert.strictEqual(marked[0].day, 15);
+	});
+
+	await test('a written date reads back as the same wall clock', () => {
+		const d = new Date(2026, 7, 15, 9, 30, 0, 0);
+		assert.strictEqual(C.formatLocalDateTime(d), '2026-08-15T09:30');
+		const back = C.parseLocalDateTime('2026-08-15T09:30');
+		assert.strictEqual(back.getFullYear(), 2026);
+		assert.strictEqual(back.getMonth(), 7);
+		assert.strictEqual(back.getDate(), 15);
+		assert.strictEqual(back.getHours(), 9);
+		assert.strictEqual(back.getMinutes(), 30);
+	});
+
+	await test('a date that does not exist is refused, not rounded', () => {
+		// new Date('2026-02-30') would quietly become 2 March.
+		assert.strictEqual(C.parseLocalDateTime('2026-02-30T09:00'), null);
+		assert.strictEqual(C.parseLocalDateTime('2026-02-29T09:00'), null);
+		assert.ok(C.parseLocalDateTime('2024-02-29T09:00'), 'a leap day is a real date');
+		assert.strictEqual(C.parseLocalDateTime('2026-13-01T09:00'), null);
+		assert.strictEqual(C.parseLocalDateTime('2026-08-15T24:00'), null);
+		assert.strictEqual(C.parseLocalDateTime('2026-08-15T09:60'), null);
+		assert.strictEqual(C.parseLocalDateTime(''), null);
+		assert.strictEqual(C.parseLocalDateTime('2026-08-15 09:30'), null);
+	});
+
+	await test('a two-digit year is refused, not read as the 1900s', () => {
+		// new Date(26, 0, 1) means 1926, so this would parse to something that
+		// does not format back to the text it came from.
+		assert.strictEqual(C.parseLocalDateTime('0026-01-01T09:00'), null);
+		assert.strictEqual(C.parseLocalDateTime('0099-01-01T09:00'), null);
+		assert.strictEqual(C.parseLocalDateTime('1969-12-31T23:59'), null);
+		assert.ok(C.parseLocalDateTime('1970-01-01T00:00'), 'the epoch is a real date');
+		assert.ok(C.parseLocalDateTime('9999-12-31T23:59'), 'and so is the far end');
+	});
+
+	await test('every date this accepts formats back to exactly what came in', () => {
+		// The round trip, checked in bulk rather than on a handful of samples.
+		for (let year = 1970; year <= 2100; year += 7) {
+			for (let month = 0; month < 12; month++) {
+				const last = C.daysInMonth(year, month);
+				for (const day of [1, 15, last]) {
+					const text =
+						year + '-' + String(month + 1).padStart(2, '0') + '-' +
+						String(day).padStart(2, '0') + 'T09:30';
+					const parsed = C.parseLocalDateTime(text);
+					assert.ok(parsed, 'refused a real date: ' + text);
+					assert.strictEqual(C.formatLocalDateTime(parsed), text);
+				}
+				// And the day after the last one never exists.
+				const overflow =
+					year + '-' + String(month + 1).padStart(2, '0') + '-' +
+					String(last + 1).padStart(2, '0') + 'T09:30';
+				assert.strictEqual(C.parseLocalDateTime(overflow), null, 'accepted ' + overflow);
+			}
+		}
+	});
+
+	group('schedule — a date and time');
+
+	await test('a one-off runs at the moment chosen, then never again', () => {
+		const s = { mode: 'datetime', at: '2026-08-15T09:30', repeat: 'once' };
+		const target = at(2026, 7, 15, 9, 30);
+		assert.strictEqual(C.nextRunAt(s, 0, at(2026, 7, 5, 12, 0)), target);
+		// Kept.
+		assert.strictEqual(C.nextRunAt(s, target, target + 1000), null);
+	});
+
+	await test('a one-off whose moment passed while the app was shut still runs', () => {
+		const s = { mode: 'datetime', at: '2026-08-15T09:30', repeat: 'once' };
+		const next = C.nextRunAt(s, 0, at(2026, 7, 20, 12, 0));
+		assert.strictEqual(next, at(2026, 7, 15, 9, 30));
+	});
+
+	await test('a date-and-time schedule with no date chosen schedules nothing', () => {
+		assert.strictEqual(
+			C.nextRunAt({ mode: 'datetime', at: '', repeat: 'daily' }, 0, at(2026, 7, 5, 12, 0)),
+			null
+		);
+	});
+
+	await test('a daily repeat keeps its clock time', () => {
+		const s = { mode: 'datetime', at: '2026-08-15T09:30', repeat: 'daily' };
+		const last = at(2026, 7, 15, 9, 30);
+		const next = new Date(C.nextRunAt(s, last, last + 1000));
+		assert.strictEqual(next.getDate(), 16);
+		assert.strictEqual(next.getHours(), 9);
+		assert.strictEqual(next.getMinutes(), 30);
+	});
+
+	await test('a weekly repeat lands on the same weekday every time', () => {
+		const s = { mode: 'datetime', at: '2026-08-15T09:30', repeat: 'weekly' };
+		const anchor = new Date(2026, 7, 15, 9, 30);
+		let cursor = anchor.getTime();
+		for (let i = 0; i < 10; i++) {
+			cursor = C.nextRunAt(s, cursor, cursor + 1000);
+			const d = new Date(cursor);
+			assert.strictEqual(d.getDay(), anchor.getDay(), 'week ' + i + ' weekday');
+			assert.strictEqual(d.getHours(), 9);
+			assert.strictEqual(d.getMinutes(), 30);
+		}
+		assert.strictEqual(new Date(cursor).getDate(), 24);
+		assert.strictEqual(new Date(cursor).getMonth(), 9);
+	});
+
+	await test('the 31st becomes the last day of a month too short for it', () => {
+		// The February case, stated plainly, and the part that matters most:
+		// the 31st comes back in March rather than being worn down to the 28th.
+		const s = { mode: 'datetime', at: '2026-01-31T08:00', repeat: 'monthly' };
+		const seen = [];
+		let cursor = at(2026, 0, 31, 8, 0);
+		for (let i = 0; i < 4; i++) {
+			cursor = C.nextRunAt(s, cursor, cursor + 1000);
+			const d = new Date(cursor);
+			seen.push(d.getMonth() + '/' + d.getDate());
+			assert.strictEqual(d.getHours(), 8);
+		}
+		assert.deepStrictEqual(seen, ['1/28', '2/31', '3/30', '4/31']);
+	});
+
+	await test('a monthly 29th finds the leap day and then February\'s end', () => {
+		const s = { mode: 'datetime', at: '2024-01-29T08:00', repeat: 'monthly' };
+		const first = new Date(C.nextRunAt(s, at(2024, 0, 29, 8, 0), at(2024, 0, 29, 8, 1)));
+		assert.strictEqual(first.getMonth(), 1);
+		assert.strictEqual(first.getDate(), 29, '2024 is a leap year');
+
+		const s25 = { mode: 'datetime', at: '2025-01-29T08:00', repeat: 'monthly' };
+		const nonLeap = new Date(C.nextRunAt(s25, at(2025, 0, 29, 8, 0), at(2025, 0, 29, 8, 1)));
+		assert.strictEqual(nonLeap.getMonth(), 1);
+		assert.strictEqual(nonLeap.getDate(), 28, '2025 is not');
+	});
+
+	await test('a clock that ran fast does not park the schedule', () => {
+		// A device set forward and then corrected leaves a stamp in the
+		// future. Trusting it would suspend every check for the whole of the
+		// skew, with nothing in the interface able to release it.
+		const now = at(2026, 7, 5, 12, 0);
+		const fromTheFuture = at(2027, 0, 1, 0, 0);
+		const next = C.nextRunAt({ mode: 'minutes', every: 5 }, fromTheFuture, now);
+		assert.ok(next !== null);
+		// Due at once, so the check that follows writes a stamp that is real.
+		// Clamping to "now" instead would answer "five minutes away" for ever
+		// and never overwrite the bad value.
+		assert.strictEqual(next, now, 'a future stamp must be discarded, not clamped');
+
+		// A one-off is not falsely reported as already kept, either.
+		const once = { mode: 'datetime', at: '2026-08-20T09:30', repeat: 'once' };
+		assert.strictEqual(
+			C.nextRunAt(once, fromTheFuture, now),
+			at(2026, 7, 20, 9, 30),
+			'a future stamp swallowed an appointment'
+		);
+	});
+
+	await test('the calendar keys its days by something every zone actually has', () => {
+		// Santiago, Beirut, Havana and Tehran move their clocks at midnight,
+		// so on two days a year local midnight does not exist. Noon does.
+		const cells = C.buildMonthGrid(2026, 7).weeks.reduce((a, w) => a.concat(w), []);
+		for (const cell of cells) {
+			const d = new Date(cell.ts);
+			assert.strictEqual(d.getHours(), 12, 'a day anchored on midnight');
+			assert.strictEqual(C.dayKey(d), cell.key);
+			assert.strictEqual(cell.key, cell.year * 10000 + cell.month * 100 + cell.day);
+		}
+		// Keys are strictly increasing across the whole grid, which is what
+		// "before today" is decided with.
+		for (let i = 1; i < cells.length; i++) {
+			assert.ok(cells[i].key > cells[i - 1].key, 'keys went backwards at ' + i);
+		}
+	});
+
+	await test('a repeat dormant for years catches up in one step, not thousands', () => {
+		// Left running daily and not opened since 2020: the answer must be the
+		// one occurrence that is now overdue, and it must come back quickly.
+		const s = { mode: 'datetime', at: '2020-01-01T07:00', repeat: 'daily' };
+		const last = at(2020, 0, 1, 7, 0);
+		const now = at(2026, 7, 5, 12, 0);
+		const next = C.nextRunAt(s, last, now);
+		const d = new Date(next);
+		assert.strictEqual(d.getFullYear(), 2020);
+		assert.strictEqual(d.getDate(), 2, 'the very next occurrence after the last check');
+		assert.strictEqual(d.getHours(), 7);
+
+		// And once that catch-up run is stamped, the schedule is back in step.
+		const after = new Date(C.nextRunAt(s, now, now + 1000));
+		assert.ok(after.getTime() > now);
+		assert.strictEqual(after.getHours(), 7);
+		assert.ok(after.getTime() - now <= 24 * 60 * 60 * 1000);
+	});
+
+	await test('every occurrence is later than the one before it', () => {
+		// Monotonic, or a schedule could stall or run backwards.
+		for (const repeat of ['daily', 'weekly', 'monthly']) {
+			const s = { mode: 'datetime', at: '2026-01-31T23:45', repeat: repeat };
+			let cursor = at(2026, 0, 31, 23, 45);
+			for (let i = 0; i < 40; i++) {
+				const next = C.nextRunAt(s, cursor, cursor + 1000);
+				assert.ok(next > cursor, repeat + ' went backwards at step ' + i);
+				cursor = next;
+			}
+		}
+	});
+
+	group('schedule — how it is described');
+
+	await test('an interval is described in its own units, singular when it is one', () => {
+		assert.strictEqual(C.describeSchedule({ mode: 'minutes', every: 2 }), 'every 2 minutes');
+		assert.strictEqual(C.describeSchedule({ mode: 'hours', every: 1 }), 'every hour');
+		assert.strictEqual(C.describeSchedule({ mode: 'days', every: 3 }), 'every 3 days');
+		assert.strictEqual(C.describeSchedule({ mode: 'weekly', every: 1 }), 'every week');
+		assert.strictEqual(C.describeSchedule({ mode: 'monthly', every: 2 }), 'every 2 months');
+	});
+
+	await test('a calendar schedule is described as a calendar, not as a number', () => {
+		const base = { mode: 'datetime', at: '2026-08-15T09:30' };
+		assert.strictEqual(
+			C.describeSchedule(Object.assign({}, base, { repeat: 'daily' })),
+			'every day at 09:30'
+		);
+		assert.strictEqual(
+			C.describeSchedule(Object.assign({}, base, { repeat: 'weekly' })),
+			'every Saturday at 09:30'
+		);
+		assert.strictEqual(
+			C.describeSchedule(Object.assign({}, base, { repeat: 'monthly' })),
+			'on the 15th of each month at 09:30'
+		);
+		assert.ok(
+			/once, on Sat 15 August 2026 at 09:30/.test(
+				C.describeSchedule(Object.assign({}, base, { repeat: 'once' }))
+			)
+		);
+		assert.ok(/none chosen yet/.test(C.describeSchedule({ mode: 'datetime', at: '' })));
+	});
+
+	await test('ordinals read the way English writes them', () => {
+		const got = [1, 2, 3, 4, 11, 12, 13, 21, 22, 23, 30, 31].map(C.ordinal);
+		assert.deepStrictEqual(got, [
+			'1st', '2nd', '3rd', '4th', '11th', '12th', '13th',
+			'21st', '22nd', '23rd', '30th', '31st',
+		]);
+	});
+
+	await test('the next check is spelled out, including when there is not one', () => {
+		const now = at(2026, 7, 5, 12, 0);
+		const soon = C.describeNextRun({ mode: 'minutes', every: 30 }, now - 60000, now);
+		assert.ok(/Next check:/.test(soon), soon);
+		assert.ok(/in 29 minutes/.test(soon), soon);
+
+		const due = C.describeNextRun({ mode: 'minutes', every: 1 }, now - 600000, now);
+		assert.ok(/due now/.test(due), due);
+
+		const spent = C.describeNextRun(
+			{ mode: 'datetime', at: '2026-08-01T09:00', repeat: 'once' },
+			at(2026, 7, 1, 9, 0),
+			now
+		);
+		assert.ok(/finished/.test(spent), spent);
+
+		const unset = C.describeNextRun({ mode: 'datetime', at: '' }, 0, now);
+		assert.ok(/No date chosen/.test(unset), unset);
+	});
+
+	await test('a wait is described roughly, in the largest unit that fits', () => {
+		assert.strictEqual(C.formatDelay(0), 'now');
+		assert.strictEqual(C.formatDelay(30 * 1000), 'in under a minute');
+		assert.strictEqual(C.formatDelay(60 * 1000), 'in 1 minute');
+		assert.strictEqual(C.formatDelay(45 * 60 * 1000), 'in 45 minutes');
+		assert.strictEqual(C.formatDelay(2 * 60 * 60 * 1000), 'in 2 hours');
+		assert.strictEqual(C.formatDelay(5 * 24 * 60 * 60 * 1000), 'in 5 days');
+	});
+
+	await test('a wait near a unit boundary is described on the right side of it', () => {
+		// Seen in the running app: a check an hour and fifty-nine minutes away
+		// was being announced as "in 1 hour".
+		assert.strictEqual(C.formatDelay(119 * 60 * 1000), 'in 2 hours');
+		assert.strictEqual(C.formatDelay(90 * 60 * 1000), 'in 2 hours');
+		assert.strictEqual(C.formatDelay(23.9 * 60 * 60 * 1000), 'in 1 day');
+		// And the rounding must never reach for a unit there is a better word
+		// for: no "in 60 minutes", no "in 24 hours".
+		for (let ms = MINUTE; ms <= 40 * DAY; ms += 7 * MINUTE + 13000) {
+			const said = C.formatDelay(ms);
+			assert.strictEqual(said.indexOf('in 60 minutes'), -1, String(ms));
+			assert.strictEqual(said.indexOf('in 24 hours'), -1, String(ms));
+			assert.ok(/^in \d+ (minute|hour|day)s?$/.test(said), said);
+		}
+	});
+
+	await test('every mode and every repeat carries an explanation', () => {
+		// The tooltips are the only thing standing between the user and six
+		// words that all look alike.
+		for (const m of C.SCHEDULE_MODES) {
+			assert.ok(m.label && m.label.length > 3, m.id + ' needs a label');
+			assert.ok(m.help && m.help.length > 40, m.id + ' needs a real explanation');
+		}
+		for (const r of C.SCHEDULE_REPEATS) {
+			assert.ok(r.help && r.help.length > 30, r.id + ' needs a real explanation');
+		}
+		assert.strictEqual(C.SCHEDULE_MODES.length, 6);
+		assert.strictEqual(C.SCHEDULE_REPEATS.length, 4);
+		// Only one of them ever stops, and it is listed last.
+		const looping = C.SCHEDULE_REPEATS.filter((r) => r.id !== 'once');
+		assert.strictEqual(looping.length, 3);
+		assert.strictEqual(C.SCHEDULE_REPEATS[C.SCHEDULE_REPEATS.length - 1].id, 'once');
+	});
+
+	await test('the shipped default still checks every two minutes', () => {
+		// Changing what a fresh install does is a decision, not a side effect.
+		const s = C.scheduleFromSettings(C.DEFAULT_SETTINGS);
+		assert.strictEqual(s.mode, 'minutes');
+		assert.strictEqual(s.every, 2);
+	});
+}
+
+/* ================= the timer that drives the schedule ================= */
+
+/**
+ * The pure half above decides *when* a check is due. This drives the half
+ * that acts on it — armCheckTimer and runScheduledCheck on the real plugin
+ * class — against a clock and a setTimeout that this test controls.
+ *
+ * Worth the scaffolding: the failure modes here are a timer that spins, a
+ * timer that never fires, and a timer that outlives the plugin, and none of
+ * them are visible from the arithmetic.
+ */
+async function checkTimerTests() {
+	group('check timer');
+
+	function fakeClock(start) {
+		let seq = 1;
+		const timers = [];
+		return {
+			now: start,
+			pending: () => timers.slice(),
+			set(fn, ms) {
+				const t = { id: seq++, at: this.now + ms, ms: ms, fn: fn };
+				timers.push(t);
+				return t.id;
+			},
+			clear(id) {
+				for (let i = 0; i < timers.length; i++) {
+					if (timers[i].id === id) return timers.splice(i, 1);
+				}
+			},
+			/** Run the one pending timer, moving the clock to when it was due. */
+			fire() {
+				const t = timers.shift();
+				if (!t) throw new Error('nothing was scheduled');
+				this.now = t.at;
+				t.fn();
+				return t;
+			},
+		};
+	}
+
+	/** Run a body with a controlled clock and window, always restoring both. */
+	function withClock(start, body) {
+		const clock = fakeClock(start);
+		const realNow = Date.now;
+		const realWindow = global.window;
+		global.window = {
+			setTimeout: (fn, ms) => clock.set(fn, ms),
+			clearTimeout: (id) => clock.clear(id),
+		};
+		Date.now = () => clock.now;
+		try {
+			return body(clock);
+		} finally {
+			Date.now = realNow;
+			if (realWindow === undefined) delete global.window;
+			else global.window = realWindow;
+		}
+	}
+
+	function makePlugin(schedule, extra) {
+		extra = extra || {};
+		const p = Object.create(plugin.prototype);
+		p.settings = Object.assign({}, C.DEFAULT_SETTINGS, extra.settings || {});
+		p.settings.githubSchedule = schedule;
+		if (extra.githubAutoSync !== undefined) p.settings.githubAutoSync = extra.githubAutoSync;
+		p.app = fakeApp();
+		p.lastCheckAt = extra.lastCheckAt || 0;
+		p.github = { mode: 'github', token: 'tok', repo: 'me/vault', branch: 'main' };
+		p.syncs = 0;
+		p.autoSync = () => {
+			p.syncs++;
+		};
+		p.refreshViews = () => {};
+		p.saveSettings = async () => {};
+		return p;
+	}
+
+	const START = new Date(2026, 7, 5, 12, 0, 0, 0).getTime();
+
+	await test('a short wait is timed exactly', () => {
+		withClock(START, (clock) => {
+			const p = makePlugin({ mode: 'minutes', every: 2 }, { lastCheckAt: START });
+			p.armCheckTimer();
+			assert.strictEqual(clock.pending().length, 1);
+			assert.strictEqual(clock.pending()[0].ms, 2 * 60 * 1000);
+		});
+	});
+
+	await test('a long wait is broken up rather than overflowing setTimeout', () => {
+		// The bug this prevents: setTimeout takes a signed 32-bit delay, so
+		// anything past ~24.8 days fires immediately and "every month" becomes
+		// a tight loop.
+		withClock(START, (clock) => {
+			for (const schedule of [
+				{ mode: 'monthly', every: 1 },
+				{ mode: 'weekly', every: 8 },
+				{ mode: 'days', every: 365 },
+			]) {
+				const p = makePlugin(schedule, { lastCheckAt: START });
+				p.armCheckTimer();
+				const waiting = clock.pending()[clock.pending().length - 1];
+				assert.ok(
+					waiting.ms <= 5 * 60 * 1000,
+					schedule.mode + ' asked setTimeout for ' + waiting.ms + 'ms'
+				);
+				assert.ok(waiting.ms < 2147483647, 'would overflow a 32-bit delay');
+			}
+		});
+	});
+
+	await test('ticking does not check until the check is actually due', () => {
+		withClock(START, (clock) => {
+			const p = makePlugin({ mode: 'hours', every: 1 }, { lastCheckAt: START });
+			p.armCheckTimer();
+			// Twelve five-minute ticks: an hour, so the last one is the check.
+			for (let i = 0; i < 11; i++) {
+				clock.fire();
+				assert.strictEqual(p.syncs, 0, 'checked early at tick ' + i);
+			}
+			clock.fire();
+			assert.strictEqual(p.syncs, 1);
+			assert.strictEqual(p.lastCheckAt, START + 60 * 60 * 1000);
+		});
+	});
+
+	await test('an overdue check runs at once, and only once', () => {
+		withClock(START, (clock) => {
+			const p = makePlugin({ mode: 'days', every: 1 }, {
+				lastCheckAt: START - 5 * 24 * 60 * 60 * 1000,
+			});
+			p.armCheckTimer();
+			assert.strictEqual(clock.pending()[0].ms, 0, 'overdue should not wait');
+			clock.fire();
+			assert.strictEqual(p.syncs, 1);
+			// Back in step: the next one is a full day away, not another catch-up.
+			assert.strictEqual(clock.pending()[0].ms, 5 * 60 * 1000);
+			clock.fire();
+			assert.strictEqual(p.syncs, 1, 'caught up twice');
+		});
+	});
+
+	await test('a check that fails still holds the schedule', () => {
+		// Otherwise a bad token or a flight would produce a check every tick
+		// for as long as it lasted.
+		withClock(START, (clock) => {
+			const p = makePlugin({ mode: 'minutes', every: 30 }, { lastCheckAt: START });
+			p.autoSync = () => {
+				p.syncs++;
+				return Promise.reject(new Error('offline')).catch(() => {});
+			};
+			p.armCheckTimer();
+			// Six five-minute ticks reach the half hour.
+			for (let i = 0; i < 6; i++) clock.fire();
+			assert.strictEqual(p.syncs, 1);
+			assert.strictEqual(p.lastCheckAt, START + 30 * 60 * 1000);
+			// Another half hour, not immediately.
+			for (let i = 0; i < 5; i++) {
+				assert.ok(clock.pending()[0].ms > 0, 'hammering after a failure');
+				clock.fire();
+			}
+			assert.strictEqual(p.syncs, 1);
+		});
+	});
+
+	await test('a due check with nothing connected waits instead of spinning', () => {
+		withClock(START, (clock) => {
+			const p = makePlugin({ mode: 'minutes', every: 5 }, { lastCheckAt: 0 });
+			p.github.token = '';
+			p.armCheckTimer();
+			for (let i = 0; i < 20; i++) {
+				const t = clock.fire();
+				assert.strictEqual(p.syncs, 0);
+				if (i > 0) assert.ok(t.ms >= 60 * 1000, 'spun with a ' + t.ms + 'ms wait');
+			}
+			// And the appointment is still waiting, not quietly used up.
+			assert.strictEqual(p.lastCheckAt, 0);
+		});
+	});
+
+	await test('switching automatic syncing off stops the checks but keeps the date', () => {
+		withClock(START, (clock) => {
+			const p = makePlugin(
+				{ mode: 'datetime', at: '2026-08-05T13:00', repeat: 'once' },
+				{ lastCheckAt: 0, githubAutoSync: false }
+			);
+			p.armCheckTimer();
+			for (let i = 0; i < 30; i++) clock.fire();
+			assert.strictEqual(p.syncs, 0);
+			assert.strictEqual(p.lastCheckAt, 0, 'the one-off was consumed');
+
+			// Switched back on, the appointment is still there and comes due.
+			p.settings.githubAutoSync = true;
+			clock.fire();
+			assert.strictEqual(p.syncs, 1);
+		});
+	});
+
+	await test('a one-off, once kept, stops the clock entirely', () => {
+		withClock(START, (clock) => {
+			const p = makePlugin(
+				{ mode: 'datetime', at: '2026-08-05T12:30', repeat: 'once' },
+				{ lastCheckAt: 0 }
+			);
+			p.armCheckTimer();
+			for (let i = 0; i < 6; i++) clock.fire();
+			assert.strictEqual(p.syncs, 1);
+			assert.strictEqual(clock.pending().length, 0, 'a spent schedule left a timer running');
+		});
+	});
+
+	await test('a repeating appointment keeps coming back', () => {
+		withClock(START, (clock) => {
+			const p = makePlugin(
+				{ mode: 'datetime', at: '2026-08-05T12:30', repeat: 'daily' },
+				{ lastCheckAt: 0 }
+			);
+			p.armCheckTimer();
+			// Tick for two days: 12:30 on the 5th and 12:30 on the 6th.
+			const until = START + 2 * 24 * 60 * 60 * 1000;
+			let guard = 0;
+			while (clock.pending().length && clock.now < until && guard++ < 5000) {
+				clock.fire();
+			}
+			assert.strictEqual(p.syncs, 2, 'expected one check per day');
+			assert.strictEqual(new Date(p.lastCheckAt).getHours(), 12);
+			assert.strictEqual(new Date(p.lastCheckAt).getMinutes(), 30);
+		});
+	});
+
+	await test('re-arming replaces the timer instead of adding another', () => {
+		// Every keystroke in the number box re-arms; a chain per keystroke
+		// would multiply the checks.
+		withClock(START, (clock) => {
+			const p = makePlugin({ mode: 'minutes', every: 10 }, { lastCheckAt: START });
+			for (let i = 0; i < 8; i++) p.armCheckTimer();
+			assert.strictEqual(clock.pending().length, 1);
+		});
+	});
+
+	await test('a changed schedule takes effect without a restart', () => {
+		withClock(START, (clock) => {
+			const p = makePlugin({ mode: 'hours', every: 6 }, { lastCheckAt: START });
+			p.armCheckTimer();
+			assert.strictEqual(clock.pending()[0].ms, 5 * 60 * 1000);
+			p.settings.githubSchedule = { mode: 'minutes', every: 1 };
+			p.restartCheckSchedule();
+			assert.strictEqual(clock.pending().length, 1);
+			assert.strictEqual(clock.pending()[0].ms, 60 * 1000);
+		});
+	});
+
+	group('loading a vault that has been upgraded');
+
+	/** Drive the real onload against stand-ins, and hand back the plugin. */
+	async function bootWith(savedData) {
+		const sink = [];
+		/* onload registers a scan interval, which reaches for window. */
+		const realWindow = global.window;
+		global.window = {
+			setInterval: () => 1,
+			clearInterval: () => {},
+			setTimeout: () => 1,
+			clearTimeout: () => {},
+		};
+		const mod = loadWithFakeObsidian(sink);
+		const p = new mod();
+		const layoutReady = [];
+		p.app = Object.assign(fakeApp(), {
+			workspace: {
+				onLayoutReady: (fn) => layoutReady.push(fn),
+				getLeavesOfType: () => [],
+				getRightLeaf: () => null,
+				revealLeaf: () => {},
+			},
+			vault: { getName: () => 'Notes', adapter: {}, on: () => ({}) },
+		});
+		p.loadData = async () => savedData;
+		p.saveData = async () => {};
+		p.runScan = async () => null;
+		p.registerEvent = () => {};
+		p.registerInterval = () => {};
+		p.registerView = () => {};
+		p.addCommand = () => {};
+		p.addRibbonIcon = () => {};
+		p.addStatusBarItem = () => fakeEl('div', null, sink);
+		p.addSettingTab = () => {};
+		try {
+			await p.onload();
+		} finally {
+			p.unloaded = true;
+			if (realWindow === undefined) delete global.window;
+			else global.window = realWindow;
+		}
+		return p;
+	}
+
+	await test('the old minutes box survives, even when a schedule was half-written', async () => {
+		// Three shapes a real data.json can be in. All of them must end up
+		// checking every 30 minutes, because that is what the user chose.
+		for (const saved of [
+			{ githubPullMinutes: 30 },
+			{ githubPullMinutes: 30, githubSchedule: {} },
+			{ githubPullMinutes: 30, githubSchedule: null },
+		]) {
+			const p = await bootWith(saved);
+			assert.strictEqual(
+				p.settings.githubSchedule.mode + '/' + p.settings.githubSchedule.every,
+				'minutes/30',
+				'lost the setting for ' + JSON.stringify(saved)
+			);
+		}
+	});
+
+	await test('a real saved schedule is loaded as it was left', async () => {
+		const p = await bootWith({
+			githubPullMinutes: 30,
+			githubSchedule: { mode: 'datetime', at: '2026-08-15T09:30', repeat: 'weekly' },
+		});
+		assert.strictEqual(p.settings.githubSchedule.mode, 'datetime');
+		assert.strictEqual(p.settings.githubSchedule.at, '2026-08-15T09:30');
+		assert.strictEqual(p.settings.githubSchedule.repeat, 'weekly');
+	});
+
+	await test('a fresh vault loads without a stored schedule and still works', async () => {
+		for (const saved of [null, undefined, {}]) {
+			const p = await bootWith(saved);
+			assert.strictEqual(p.settings.githubSchedule.mode, 'minutes');
+			assert.strictEqual(p.settings.githubSchedule.every, 2);
+			assert.strictEqual(p.lastCheckAt, 0);
+		}
+	});
+
+	await test('a vault not kept in a repository arms no timer at all', () => {
+		// The default. Waking every minute to rediscover there is no
+		// repository is a background cost paid by everyone who never turns
+		// GitHub on — and on a phone, paid in battery.
+		withClock(START, (clock) => {
+			for (const mode of ['ecosystem', '', undefined]) {
+				const p = makePlugin({ mode: 'minutes', every: 2 }, { lastCheckAt: 0 });
+				p.github.mode = mode;
+				p.armCheckTimer();
+				assert.strictEqual(
+					clock.pending().length,
+					0,
+					'storage mode ' + mode + ' left a timer running'
+				);
+			}
+			// Turning GitHub on puts it straight back on the clock.
+			const p = makePlugin({ mode: 'minutes', every: 2 }, { lastCheckAt: 0 });
+			p.github.mode = 'ecosystem';
+			p.armCheckTimer();
+			assert.strictEqual(clock.pending().length, 0);
+			p.github.mode = 'github';
+			p.restartCheckSchedule();
+			assert.strictEqual(clock.pending().length, 1);
+		});
+	});
+
+	await test('one thrown exception does not kill the schedule for good', () => {
+		// The chain is the only thing keeping checks alive: the callback drops
+		// the timer handle before running, so a throw anywhere in the body
+		// would leave nothing scheduled until Obsidian restarted.
+		// A clock each: two plugins sharing one would interleave their chains,
+		// and the fire() calls would land on the wrong plugin's timer.
+		for (const breakIt of ['refreshViews', 'autoSync']) {
+			withClock(START, (clock) => {
+				const p = makePlugin({ mode: 'minutes', every: 5 }, { lastCheckAt: START });
+				let checks = 0;
+				p.autoSync = () => {
+					checks++;
+				};
+				p.refreshViews = () => {};
+				const wrapped = p[breakIt];
+				p[breakIt] = () => {
+					wrapped();
+					throw new Error('the panel was torn down');
+				};
+				p.armCheckTimer();
+				for (let i = 0; i < 20; i++) {
+					if (!clock.pending().length) break;
+					clock.fire();
+				}
+				assert.strictEqual(
+					clock.pending().length,
+					1,
+					breakIt + ' throwing left the chain dead'
+				);
+				assert.strictEqual(checks, 20, breakIt + ' only ran ' + checks + ' check(s)');
+			});
+		}
+	});
+
+	await test('a clock that ran fast releases within one period', () => {
+		withClock(START, (clock) => {
+			const p = makePlugin({ mode: 'minutes', every: 5 }, {
+				lastCheckAt: START + 180 * 24 * 60 * 60 * 1000,
+			});
+			p.armCheckTimer();
+			assert.strictEqual(clock.pending()[0].ms, 0, 'a bad stamp must not park the check');
+			clock.fire();
+			assert.strictEqual(p.syncs, 1, 'parked for the whole clock skew');
+			// And the stamp it wrote is a real one, so it is back in step.
+			assert.strictEqual(p.lastCheckAt, START);
+			assert.strictEqual(clock.pending()[0].ms, 5 * 60 * 1000);
+		});
+	});
+
+	await test('unloading the plugin stops the chain', () => {
+		withClock(START, (clock) => {
+			const p = makePlugin({ mode: 'minutes', every: 2 }, { lastCheckAt: START });
+			p.armCheckTimer();
+			p.onunload();
+			assert.strictEqual(clock.pending().length, 0);
+
+			// A tick already in flight when the plugin was disabled must
+			// neither sync nor put another one on the clock. The check is
+			// deliberately overdue here, so nothing but the unload guard can
+			// be what stops it.
+			clock.now = START + 60 * 60 * 1000;
+			p.runScheduledCheck();
+			assert.strictEqual(p.syncs, 0, 'synced from a disabled plugin');
+			assert.strictEqual(p.lastCheckAt, START, 'stamped from a disabled plugin');
+			assert.strictEqual(clock.pending().length, 0);
+
+			p.armCheckTimer();
+			assert.strictEqual(clock.pending().length, 0);
+		});
+	});
+}
+
 async function githubTests() {
 	const G = plugin.__github;
 	const noSleep = async () => {};
@@ -3077,8 +4038,19 @@ function fakeEl(tag, o, sink) {
 			node.text = t;
 			sink.push(t);
 		},
-		addEventListener: () => {},
-		setAttribute: () => {},
+		listeners: Object.create(null),
+		addEventListener: (type, fn) => {
+			(node.listeners[type] || (node.listeners[type] = [])).push(fn);
+		},
+		/** Replay every handler of a type, so a click can actually be tested. */
+		fire: (type) => {
+			const fns = node.listeners[type] || [];
+			for (let i = 0; i < fns.length; i++) fns[i]();
+		},
+		setAttribute: (k, v) => {
+			node.attrs[k] = v;
+		},
+		attrs: Object.create(null),
 	};
 	if (node.text) sink.push(node.text);
 	return node;
@@ -3494,6 +4466,265 @@ async function uiTests() {
 			-1,
 			'but there must be no settings row for something unused'
 		);
+	});
+
+	group('rendered check schedule');
+
+	function renderSchedule(schedule, lastCheckAt) {
+		const sink = [];
+		const mod = loadWithFakeObsidian(sink);
+		const p = fakePluginFor('apple', scan);
+		p.github = Object.assign(p.github, {
+			mode: 'github',
+			token: 'tok',
+			login: 'someone',
+			repo: 'me/vault',
+		});
+		if (schedule) p.settings.githubSchedule = schedule;
+		p.lastCheckAt = lastCheckAt || 0;
+		p.restartCheckSchedule = () => {};
+		const tab = Object.create(mod.__ui.JemzSyncSettingTab.prototype);
+		tab.app = p.app;
+		tab.plugin = p;
+		tab.containerEl = fakeEl('div', null, sink);
+		tab.displayStorage(tab.containerEl);
+		return { sink: sink, text: sink.join('\n'), plugin: p, tab: tab };
+	}
+
+	await test('all six kinds of schedule are offered', () => {
+		const r = renderSchedule();
+		const options = r.sink.filter((s) => s.indexOf('[option] ') === 0);
+		for (const m of C.SCHEDULE_MODES) {
+			assert.ok(
+				options.indexOf('[option] ' + m.label) !== -1,
+				'missing ' + m.id + ' in ' + options.join(' | ')
+			);
+		}
+	});
+
+	await test('the pane explains the schedule that is actually selected', () => {
+		const hours = renderSchedule({ mode: 'hours', every: 6 }).text;
+		assert.ok(hours.indexOf('[name] Check schedule') !== -1, hours);
+		assert.ok(hours.indexOf('[name] How many hours') !== -1, hours);
+		// The live summary carries the sentence; the field description must
+		// not restate it, because it goes stale the moment you start typing.
+		assert.ok(/every 6 hours/.test(hours), hours);
+		assert.ok(/repeats for ever/.test(hours), hours);
+		// And it does not leave the old wording behind.
+		assert.strictEqual(hours.indexOf('[name] Check GitHub every'), -1, hours);
+	});
+
+	await test('the number box says what a valid number is', () => {
+		const weekly = renderSchedule({ mode: 'weekly', every: 2 }).text;
+		assert.ok(/between 1 and 52/.test(weekly), weekly);
+	});
+
+	await test('choosing a date and time offers a calendar and a repeat', () => {
+		const r = renderSchedule({ mode: 'datetime', at: '2026-08-15T09:30', repeat: 'weekly' });
+		assert.ok(r.text.indexOf('[name] Date and time') !== -1, r.text);
+		assert.ok(r.text.indexOf('[name] Repeat') !== -1, r.text);
+		assert.ok(/Sat 15 August 2026 at 09:30/.test(r.text), r.text);
+		// The four repeats, and no number box, because there is no interval.
+		const options = r.sink.filter((s) => s.indexOf('[option] ') === 0).join(' | ');
+		for (const rep of C.SCHEDULE_REPEATS) {
+			assert.ok(options.indexOf(rep.label) !== -1, 'missing ' + rep.id + ': ' + options);
+		}
+		assert.strictEqual(r.text.indexOf('[name] How many'), -1, r.text);
+	});
+
+	await test('with no date picked, the pane says so instead of pretending', () => {
+		const r = renderSchedule({ mode: 'datetime', at: '', repeat: 'once' });
+		assert.ok(/No date chosen yet/.test(r.text), r.text);
+		assert.ok(/Pick a date/.test(r.text), r.text);
+	});
+
+	await test('the pane always says when the next check is', () => {
+		const now = Date.now();
+		const r = renderSchedule({ mode: 'minutes', every: 15 }, now - 60000);
+		assert.ok(/Next check:/.test(r.text), r.text);
+		assert.ok(/Last checked/.test(r.text), r.text);
+
+		const fresh = renderSchedule({ mode: 'minutes', every: 15 }, 0);
+		assert.ok(/Not checked yet/.test(fresh.text), fresh.text);
+	});
+
+	await test('every row carries an "i" that opens the same explanation', () => {
+		const r = renderSchedule({ mode: 'datetime', at: '2026-08-15T09:30' });
+		const tips = r.sink.filter((s) => s.indexOf('[tooltip] ') === 0).join(' | ');
+		assert.ok(/each kind of schedule/.test(tips), tips);
+		assert.ok(/short months and leap years/.test(tips), tips);
+	});
+
+	await test('the schedule help exists and answers the awkward questions', () => {
+		const help = plugin.__ui.HELP_TOPICS.schedule;
+		assert.ok(help, 'no schedule help topic');
+		const all = [help.intro].concat(help.steps, help.notes).join(' ');
+		assert.ok(/leap year/i.test(all), 'must cover February');
+		assert.ok(/per device/i.test(all), 'must say the schedule is per device');
+		assert.ok(/Sync now/.test(all), 'must point at the immediate check');
+	});
+
+	await test('changing the schedule saves it and re-arms the timer at once', () => {
+		// Not on restart: someone setting this on a phone will not restart it.
+		const r = renderSchedule({ mode: 'minutes', every: 2 });
+		let rearmed = 0;
+		r.plugin.restartCheckSchedule = () => rearmed++;
+		return r.tab
+			.saveSchedule({ mode: 'days', every: 3 }, false)
+			.then(() => {
+				assert.strictEqual(r.plugin.settings.githubSchedule.mode, 'days');
+				assert.strictEqual(r.plugin.settings.githubSchedule.every, 3);
+				assert.strictEqual(rearmed, 1);
+			});
+	});
+
+	await test('typing an interval and then changing the kind keeps both edits', () => {
+		// The stale-closure bug: handlers must read the schedule when they
+		// fire, not the copy that was current when the row was drawn.
+		const r = renderSchedule({ mode: 'hours', every: 2 });
+		return r.tab
+			.saveSchedule(Object.assign(r.tab.currentSchedule(), { every: 9 }), false)
+			.then(() => r.tab.saveSchedule(
+				Object.assign(r.tab.currentSchedule(), { mode: 'days' }),
+				false
+			))
+			.then(() => {
+				assert.strictEqual(r.plugin.settings.githubSchedule.mode, 'days');
+				assert.strictEqual(r.plugin.settings.githubSchedule.every, 9, 'the typed 9 was lost');
+			});
+	});
+
+	await test('saving a schedule never writes through to the shipped defaults', () => {
+		// Object.assign over a shared object literal would leak one vault's
+		// choice into the next.
+		const before = JSON.stringify(C.DEFAULT_SETTINGS.githubSchedule);
+		const r = renderSchedule();
+		return r.tab
+			.saveSchedule(Object.assign(r.tab.currentSchedule(), { mode: 'weekly', every: 4 }), false)
+			.then(() => {
+				assert.strictEqual(JSON.stringify(C.DEFAULT_SETTINGS.githubSchedule), before);
+			});
+	});
+
+	await test('a nonsense schedule cannot be saved, however it arrives', () => {
+		const r = renderSchedule();
+		return r.tab.saveSchedule({ mode: 'hours', every: -4 }, false).then(() => {
+			assert.strictEqual(r.plugin.settings.githubSchedule.every, 1);
+		});
+	});
+
+	group('rendered date picker');
+
+	function renderPicker(initial) {
+		const sink = [];
+		const mod = loadWithFakeObsidian(sink);
+		const app = fakeApp();
+		const modal = new mod.__ui.DateTimePickerModal(app, initial || null, () => {});
+		modal.onOpen();
+		return { sink: sink, text: sink.join('\n'), modal: modal };
+	}
+
+	await test('the picker opens on any month without throwing', () => {
+		for (let m = 0; m < 12; m++) {
+			assert.doesNotThrow(
+				() => renderPicker(new Date(2026, m, 15, 9, 30)),
+				'month ' + m + ' threw'
+			);
+		}
+		assert.doesNotThrow(() => renderPicker(new Date(2024, 1, 29, 9, 30)), 'leap day threw');
+	});
+
+	await test('it draws the month it was opened on, with both headings', () => {
+		const r = renderPicker(new Date(2026, 7, 15, 9, 30));
+		assert.ok(r.text.indexOf('August 2026') !== -1, r.text);
+		for (const day of C.WEEKDAY_SHORT) {
+			assert.ok(r.text.split('\n').indexOf(day) !== -1, 'no ' + day + ' heading');
+		}
+		assert.ok(/Sat 15 August 2026 at 09:30/.test(r.text), r.text);
+	});
+
+	await test('the whole month is on the grid — 42 cells, every day of it', () => {
+		const r = renderPicker(new Date(2026, 7, 15, 9, 30));
+		const cells = r.modal.gridEl.children;
+		assert.strictEqual(cells.length, 42, 'six weeks of seven days');
+		const days = cells.map((c) => Number(c.text));
+		for (let d = 1; d <= 31; d++) {
+			assert.ok(days.indexOf(d) !== -1, 'August has no ' + d);
+		}
+	});
+
+	await test('February draws 29 days in a leap year and 28 otherwise', () => {
+		const leap = renderPicker(new Date(2024, 1, 15, 9, 0)).modal.gridEl.children.map(
+			(c) => c.cls + ' ' + c.text
+		);
+		assert.strictEqual(leap.filter((c) => c.indexOf('is-outside') === -1).length, 29);
+
+		const common = renderPicker(new Date(2026, 1, 15, 9, 0)).modal.gridEl.children.map(
+			(c) => c.cls + ' ' + c.text
+		);
+		assert.strictEqual(common.filter((c) => c.indexOf('is-outside') === -1).length, 28);
+	});
+
+	await test('paging moves the month and rolls the year over', () => {
+		const r = renderPicker(new Date(2026, 11, 15, 9, 30));
+		r.modal.page(1);
+		assert.strictEqual(r.modal.titleEl.text, 'January 2027');
+		r.modal.page(-1);
+		assert.strictEqual(r.modal.titleEl.text, 'December 2026');
+		r.modal.page(12);
+		assert.strictEqual(r.modal.titleEl.text, 'December 2027');
+	});
+
+	await test('a day already gone cannot be picked', () => {
+		// Opened on a month that is entirely in the past.
+		const r = renderPicker(new Date(2020, 0, 15, 9, 0));
+		const cells = r.modal.gridEl.children;
+		const pickable = cells.filter((c) => !c.disabled);
+		assert.strictEqual(pickable.length, 0, 'January 2020 offered a day');
+	});
+
+	await test('a moment that has already passed cannot be accepted', () => {
+		// Not tidiness. "Just once" decides it has been kept by comparing the
+		// chosen moment with when this device last checked, so a moment older
+		// than that last check would be born spent — the pane would report the
+		// schedule as finished without ever having run it.
+		const r = renderPicker(new Date(2026, 7, 15, 9, 30));
+		const past = new Date(Date.now() - 60 * 60 * 1000);
+		r.modal.selected = past;
+		r.modal.viewYear = past.getFullYear();
+		r.modal.viewMonth = past.getMonth();
+		r.modal.renderGrid();
+		assert.strictEqual(r.modal.useEl.disabled, true, 'a past moment was offered');
+		assert.ok(/already passed/.test(r.modal.chosenEl.text), r.modal.chosenEl.text);
+
+		// And clicking anyway hands nothing back — the disabled attribute is
+		// a courtesy, the guard in the handler is the rule.
+		let handed = null;
+		r.modal.onPick = (d) => {
+			handed = d;
+		};
+		r.modal.close = () => {};
+		r.modal.useEl.fire('click');
+		assert.strictEqual(handed, null, 'a past moment was handed back anyway');
+
+		// A future moment is accepted and described.
+		const soon = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000);
+		r.modal.selected = soon;
+		r.modal.viewYear = soon.getFullYear();
+		r.modal.viewMonth = soon.getMonth();
+		r.modal.renderGrid();
+		assert.strictEqual(r.modal.useEl.disabled, false);
+		assert.ok(/in 3 days/.test(r.modal.chosenEl.text), r.modal.chosenEl.text);
+		r.modal.useEl.fire('click');
+		assert.ok(handed, 'a future moment was refused');
+		assert.strictEqual(handed.getTime(), soon.getTime());
+	});
+
+	await test('the hour and the minute are both offered in full', () => {
+		const r = renderPicker(new Date(2026, 7, 15, 9, 30));
+		const options = r.sink.filter((s) => s.indexOf('[option] ') === 0);
+		assert.strictEqual(options.filter((s) => / h$/.test(s)).length, 24);
+		assert.strictEqual(options.filter((s) => / min$/.test(s)).length, 60);
 	});
 
 	await test('the fingerprint field has an "i" that explains how to get one', () => {
@@ -4254,6 +5485,36 @@ async function deviceStateTests() {
 		assert.strictEqual(second.pairing.files, 15);
 	});
 
+	await test('when this device last checked is kept off the vault entirely', () => {
+		// It is state, not a preference. In settings it would ride the vault's
+		// own cloud to the other devices, and one device's check would count
+		// for all of them.
+		assert.ok(Object.prototype.hasOwnProperty.call(C.DEFAULT_SETTINGS, 'githubSchedule'));
+		assert.strictEqual(
+			Object.prototype.hasOwnProperty.call(C.DEFAULT_SETTINGS, 'githubLastCheckAt'),
+			false,
+			'the check stamp must not be a setting'
+		);
+
+		const app = fakeApp();
+		assert.strictEqual(D.loadLastCheck(app), 0);
+		D.saveLastCheck(app, 1234567);
+		assert.strictEqual(D.loadLastCheck(app), 1234567);
+		// And it really is device-local storage, not saveData.
+		assert.ok(
+			JSON.stringify(app.__local || {}).indexOf('1234567') !== -1 ||
+				D.loadLastCheck(app) === 1234567
+		);
+	});
+
+	await test('a nonsense check stamp reads back as never', () => {
+		const app = fakeApp();
+		for (const bad of [-5, NaN, 'soon', null, undefined]) {
+			D.saveLastCheck(app, bad);
+			assert.strictEqual(D.loadLastCheck(app), 0, String(bad));
+		}
+	});
+
 	await test('storage that throws is survivable', () => {
 		const hostile = {
 			loadLocalStorage() {
@@ -4288,6 +5549,8 @@ async function deviceStateTests() {
 	await deviceNameTests();
 	await languageTests();
 	await deviceStateTests();
+	await scheduleTests();
+	await checkTimerTests();
 	await githubTests();
 	await uiTests();
 	await moduleTests();

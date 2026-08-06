@@ -204,9 +204,41 @@ Settings → jemzsync → **Where this vault is stored**. Three choices:
 
 ### Keeping in sync
 
-With GitHub storage on, jemzsync sends your changes about ten seconds after you stop typing, and checks for other devices' work every few minutes. Both are adjustable, and both can be switched off in favour of a **Sync now** button.
+With GitHub storage on, jemzsync sends your changes about ten seconds after you stop typing, and checks for other devices' work on a schedule you set. Both are adjustable, and both can be switched off in favour of a **Sync now** button.
 
-Receiving is a poll, not a push, and it is worth being clear why: GitHub has no way to notify a plugin that something changed. Sending is immediate because that is the half that can lose work if the device goes away; receiving can wait a few minutes.
+Receiving is a poll, not a push, and it is worth being clear why: GitHub has no way to notify a plugin that something changed. Sending is immediate because that is the half that can lose work if the device goes away; receiving can wait.
+
+### Choosing when it checks
+
+Settings → jemzsync → **Check schedule**. Six kinds, and you pick one:
+
+| Kind | What it means |
+|---|---|
+| **Every so many minutes** *(default: 2)* | Wait that many minutes after the last check, then check again |
+| **Every so many hours** | The same, in hours |
+| **Every so many days** | The same, in days. A day is a full 24 hours, not "tomorrow morning" |
+| **Every so many weeks** | The same, counting a week as 7 days |
+| **Every so many months** | The same, counting a month as 30 days |
+| **On a date and time** | A real calendar moment, picked from a calendar. Then choose how it comes round: **every day**, **every week** or **every month** *(the default)* — or **just once, then stop** |
+
+**Whatever you choose, it loops.** You are setting a rhythm, not booking a single appointment: the check keeps happening on that schedule until you change it. The one exception is spelled out on screen — "Just once, then stop" is the only choice that ever finishes.
+
+The first five count from the end of the last check, so they drift relative to the calendar — that is what makes them simple. The sixth follows the calendar properly: February is 28 days, or 29 in a leap year, and a monthly repeat on the 31st falls back to the last day of any month too short to hold it, then returns to the 31st in March. The date you picked is never quietly rewritten.
+
+The calendar is drawn by the plugin rather than handed to the operating system, so it looks and behaves the same on a Mac, an iPhone and an Android phone, and every day is a comfortable tap target.
+
+A few things worth knowing:
+
+- **A check missed while Obsidian was closed happens on the next launch**, rather than being skipped to the following slot. This matters most on a phone, which suspends the app whenever you put it down.
+- **The time is your device's wall clock.** Nine in the morning stays nine in the morning across a daylight-saving change or a flight to another time zone.
+- **The calendar only offers the future.** A moment that has already gone cannot be chosen, because "just once" would then be finished before it ever ran.
+- **Each device counts its own checks.** The schedule itself lives in the plugin's settings, which sit inside the vault — so if iCloud or Google Drive is carrying your vault, your devices share it, exactly as the old "check every N minutes" box did. The record of when a device last checked is kept on that device and never written into the vault, so a weekly schedule means weekly *on each device* rather than once between them.
+- **Switching "Keep in sync automatically" off stops both halves.** A one-off date is not used up while it is off.
+- **Nothing is scheduled at all unless the vault uses GitHub.** On "this device's cloud only" there is no timer running.
+- **Sending is not on this schedule.** Your own edits still go up about ten seconds after you stop typing.
+- **Upgrading keeps what you had.** A vault set to "check every 30 minutes" before this feature existed comes up as "every so many minutes: 30".
+
+Finding nothing costs three API requests against GitHub's limit of 5,000 an hour, so even every two minutes uses under 2% of it. Actually fetching changes costs more, but only when there are changes to fetch. The schedule is about how soon you want another device's work to appear, not about a quota.
 
 ### When two devices edit the same note
 

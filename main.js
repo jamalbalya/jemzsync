@@ -1,4 +1,4 @@
-/* jemzsync 2.0.2 — generated from src/main.js by build.js. Edit the source, not this file. */
+/* jemzsync 2.1.0 — generated from src/main.js by build.js. Edit the source, not this file. */
 'use strict';
 
 /*
@@ -164,6 +164,24 @@ const LIVE_SCAN_DEBOUNCE_MS = 8 * 1000;
  */
 const GITHUB_SYNC_DEBOUNCE_MS = 10 * 1000;
 
+/**
+ * The longest a single timeout may be set for.
+ *
+ * setTimeout takes a signed 32-bit delay, so a wait longer than about 24.8
+ * days overflows and fires immediately — "check every month" would become a
+ * loop. Waiting in capped steps and re-checking the clock avoids that, and
+ * also survives the machine being asleep for the middle of the wait, which a
+ * single long timeout does not.
+ */
+const CHECK_TICK_MAX_MS = 5 * 60 * 1000;
+
+/**
+ * How long to wait before looking again when a check is due but impossible —
+ * no repository connected, or automatic syncing switched off. Long enough not
+ * to spin, short enough that reconnecting is noticed promptly.
+ */
+const CHECK_IDLE_MS = 60 * 1000;
+
 /** The private iCloud container Obsidian owns. Mobile Obsidian only reads vaults from here. */
 const OBSIDIAN_CONTAINER = 'iCloud~md~obsidian';
 /** Generic iCloud Drive. A vault here syncs, but mobile Obsidian will not list it. */
@@ -272,8 +290,29 @@ const DEFAULT_SETTINGS = {
 	 * notify a plugin, so the interval *is* the latency. Three requests per
 	 * check against a 5,000/hour limit is under 2% of the budget, so there is
 	 * no reason to make people wait longer than this.
+	 *
+	 * Superseded by `githubSchedule` below, and kept only so that a vault
+	 * settled on, say, 30 minutes carries that across the upgrade rather than
+	 * being quietly reset. See scheduleFromSettings.
 	 */
 	githubPullMinutes: 2,
+	/**
+	 * When to check, in full.
+	 *
+	 * `mode` is one of SCHEDULE_MODES; `every` counts that mode's unit; `at`
+	 * and `repeat` are used only by the date-and-time mode. The default keeps
+	 * the behaviour every existing install already has.
+	 */
+	githubSchedule: {
+		mode: 'minutes',
+		every: 2,
+		at: '',
+		repeat: 'monthly',
+	},
+	/*
+	 * When this device last checked is deliberately NOT here. It is per-device
+	 * state, kept out of the vault — see LAST_CHECK_KEY.
+	 */
 };
 
 /* ================================================================== *
@@ -1409,6 +1448,585 @@ function shouldRescanForChange(path, settings) {
 }
 
 /* ================================================================== *
+ * CHECK SCHEDULE — pure logic
+ *
+ * Deciding *when* to look at GitHub. All of it is arithmetic over a
+ * schedule, a "last checked" stamp and a clock passed in, so every rule
+ * below — including the awkward ones, like the 31st of a month that has
+ * only 28 days — is unit-tested without a timer and without a network.
+ *
+ * Two families of schedule, and they answer different questions:
+ *
+ *   an interval  — "again, this long after the last check". Elapsed time
+ *                  is all that matters, so this is plain millisecond
+ *                  arithmetic and a day is exactly 24 hours.
+ *
+ *   a date and time — "at this moment on the calendar", optionally
+ *                  repeating. Here the clock time is the point, so the
+ *                  arithmetic is done on local date components: 09:30
+ *                  stays 09:30 through a daylight-saving change, and the
+ *                  31st becomes the 28th in February rather than leaking
+ *                  into March.
+ * ================================================================== */
+
+const MINUTE_MS = 60 * 1000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+
+/**
+ * The schedules a user can choose between.
+ *
+ * `every` is what the unit means in milliseconds; the last entry has none
+ * because a calendar appointment is not an interval. `help` is the tooltip —
+ * one sentence, and it has to say what the choice *does*, not restate its
+ * own name, because on a phone the tooltip is the only explanation there is
+ * room for.
+ *
+ * The week and the month here are deliberately fixed lengths — 7 days and 30
+ * days from the last check — rather than "the same weekday" or "the same date
+ * next month". Those are what the date-and-time schedule is for, and having
+ * both meanings hiding under one word would make the setting unpredictable.
+ */
+const SCHEDULE_MODES = [
+	{
+		id: 'minutes',
+		label: 'Every so many minutes',
+		unit: 'minutes',
+		one: 'minute',
+		ms: MINUTE_MS,
+		max: 60 * 24,
+		help: 'Check again this many minutes after the last check. The shortest wait, and the one that makes another device\'s work appear soonest.',
+	},
+	{
+		id: 'hours',
+		label: 'Every so many hours',
+		unit: 'hours',
+		one: 'hour',
+		ms: HOUR_MS,
+		max: 24 * 31,
+		help: 'Check again this many hours after the last check. A good middle ground if you move between devices a few times a day.',
+	},
+	{
+		id: 'days',
+		label: 'Every so many days',
+		unit: 'days',
+		one: 'day',
+		ms: DAY_MS,
+		max: 365,
+		help: 'Check again this many days after the last check. One day means a full 24 hours, not "tomorrow morning".',
+	},
+	{
+		id: 'weekly',
+		label: 'Every so many weeks',
+		unit: 'weeks',
+		one: 'week',
+		ms: 7 * DAY_MS,
+		max: 52,
+		help: 'Check again this many weeks after the last check. One week counts as 7 days.',
+	},
+	{
+		id: 'monthly',
+		label: 'Every so many months',
+		unit: 'months',
+		one: 'month',
+		ms: 30 * DAY_MS,
+		max: 12,
+		help: 'Check again this many months after the last check. One month counts as 30 days — for a real calendar date, such as the 1st of each month, choose "On a date and time" instead.',
+	},
+	{
+		id: 'datetime',
+		label: 'On a date and time',
+		unit: '',
+		one: '',
+		ms: 0,
+		max: 0,
+		help: 'Check at a moment you pick on a calendar, then keep checking — every day, every week or every month, whichever you choose. This is the one that follows the real calendar, so February is 28 days — or 29 in a leap year — and the 31st of a short month becomes its last day.',
+	},
+];
+
+/**
+ * How a date-and-time schedule comes back around.
+ *
+ * Every schedule in this plugin loops: whatever you set, the check keeps
+ * happening on it until you change it. The three repeats below are the loop
+ * for a calendar date, and one of them is always what a new schedule gets.
+ * "Just once" is the deliberate exception, which is why it is listed last —
+ * it is the only choice that ever stops.
+ */
+const SCHEDULE_REPEATS = [
+	{
+		id: 'daily',
+		label: 'Every day at that time',
+		help: 'Check at the same time every day, starting on the date you picked, and keep doing it.',
+	},
+	{
+		id: 'weekly',
+		label: 'Every week on that day',
+		help: 'Check on the same weekday at the same time every week, starting on the date you picked, and keep doing it.',
+	},
+	{
+		id: 'monthly',
+		label: 'Every month on that date',
+		help: 'Check on the same date each month at the same time, and keep doing it. A 29th, 30th or 31st falls back to the last day of any month too short to hold it — so the 31st is the 28th in February, and the 29th in a leap year, before returning to the 31st in March.',
+	},
+	{
+		id: 'once',
+		label: 'Just once, then stop',
+		help: 'The only choice that does not repeat. Check at that moment and no more; afterwards this pane asks you to pick another date.',
+	},
+];
+
+/**
+ * The repeat a calendar schedule gets when it does not say.
+ *
+ * Monthly, because a date is the thing being picked and a date recurs monthly
+ * — choosing the 15th and being checked on the 15th is the least surprising
+ * reading of it. It also loops, which every schedule here does by default.
+ */
+const DEFAULT_REPEAT = 'monthly';
+
+const MONTH_NAMES = [
+	'January', 'February', 'March', 'April', 'May', 'June',
+	'July', 'August', 'September', 'October', 'November', 'December',
+];
+
+/** Monday first, matching the calendar the picker draws. */
+const WEEKDAY_SHORT = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
+const WEEKDAY_LONG = [
+	'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday',
+];
+
+/** Look a mode up by id, falling back to the default rather than throwing. */
+function scheduleMode(id) {
+	for (let i = 0; i < SCHEDULE_MODES.length; i++) {
+		if (SCHEDULE_MODES[i].id === id) return SCHEDULE_MODES[i];
+	}
+	return SCHEDULE_MODES[0];
+}
+
+function scheduleRepeat(id) {
+	for (let i = 0; i < SCHEDULE_REPEATS.length; i++) {
+		if (SCHEDULE_REPEATS[i].id === id) return SCHEDULE_REPEATS[i];
+	}
+	/* Not the first entry: an unrecognised repeat must fall back to the
+	 * documented default, and it must be one that loops. */
+	for (let i = 0; i < SCHEDULE_REPEATS.length; i++) {
+		if (SCHEDULE_REPEATS[i].id === DEFAULT_REPEAT) return SCHEDULE_REPEATS[i];
+	}
+	return SCHEDULE_REPEATS[0];
+}
+
+/**
+ * How many days a month really has.
+ *
+ * Day 0 of the next month is the last day of this one, which gets the leap
+ * year right without restating the rule — and the rule is not simply "every
+ * four years": 1900 had 28 days in February and 2000 had 29.
+ *
+ * @param {number} year full year, e.g. 2026
+ * @param {number} month 0-11
+ */
+function daysInMonth(year, month) {
+	return new Date(year, month + 1, 0).getDate();
+}
+
+/** Monday=0 … Sunday=6. JavaScript counts from Sunday; the calendar does not. */
+function mondayIndex(date) {
+	return (date.getDay() + 6) % 7;
+}
+
+/** Midnight local time on the same day. */
+function startOfDay(date) {
+	return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+/**
+ * A calendar day as one comparable number: 20260815 for 15 August 2026.
+ *
+ * Days are compared through this rather than through timestamps because
+ * midnight is not a reliable handle on a day. Santiago, Beirut, Havana and
+ * Tehran move their clocks *at* midnight, so on two days a year the local
+ * midnight does not exist and `new Date(y, m, d)` lands on 01:00 — or, in the
+ * worst case, on the following day. An integer key cannot drift.
+ */
+function dayKey(date) {
+	return date.getFullYear() * 10000 + date.getMonth() * 100 + date.getDate();
+}
+
+/**
+ * The grid a month is drawn on: whole weeks, Monday to Sunday, with the
+ * neighbouring months' days filling the corners.
+ *
+ * Always six rows. A month can genuinely need six — a 31-day month starting
+ * on a Sunday spans six weeks — and a grid that changed height as you paged
+ * through the year would make the buttons move under your thumb.
+ *
+ * @param {number} year
+ * @param {number} month 0-11
+ * @param {number} [todayTs] so "today" can be marked without reading the clock
+ * @returns {{year: number, month: number, label: string,
+ *            weeks: Array<Array<{day: number, month: number, year: number,
+ *            inMonth: boolean, weekend: boolean, today: boolean, ts: number}>>}}
+ */
+function buildMonthGrid(year, month, todayTs) {
+	/* Normalise a month outside 0-11 so paging past December just works. */
+	const first = new Date(year, month, 1);
+	year = first.getFullYear();
+	month = first.getMonth();
+
+	const todayCell = todayTs ? dayKey(new Date(todayTs)) : null;
+	const lead = mondayIndex(first);
+	const weeks = [];
+
+	for (let row = 0; row < 6; row++) {
+		const week = [];
+		for (let col = 0; col < 7; col++) {
+			const offset = row * 7 + col - lead;
+			/* Anchored at noon, which exists on every day in every zone. */
+			const cellDate = new Date(year, month, 1 + offset, 12, 0, 0, 0);
+			const key = dayKey(cellDate);
+			week.push({
+				day: cellDate.getDate(),
+				month: cellDate.getMonth(),
+				year: cellDate.getFullYear(),
+				inMonth: cellDate.getMonth() === month && cellDate.getFullYear() === year,
+				weekend: mondayIndex(cellDate) >= 5,
+				today: todayCell !== null && key === todayCell,
+				key: key,
+				ts: cellDate.getTime(),
+			});
+		}
+		weeks.push(week);
+	}
+
+	return { year: year, month: month, label: MONTH_NAMES[month] + ' ' + year, weeks: weeks };
+}
+
+function pad2(n) {
+	return (n < 10 ? '0' : '') + n;
+}
+
+/**
+ * A local date and time as text: `2026-08-15T09:30`.
+ *
+ * Deliberately not an ISO instant. What is stored is the wall clock the user
+ * pointed at, so a vault carried into another time zone still checks at half
+ * past nine in the morning rather than at whatever that used to be in UTC.
+ */
+function formatLocalDateTime(date) {
+	if (!date || isNaN(date.getTime())) return '';
+	return (
+		date.getFullYear() + '-' + pad2(date.getMonth() + 1) + '-' + pad2(date.getDate()) +
+		'T' + pad2(date.getHours()) + ':' + pad2(date.getMinutes())
+	);
+}
+
+/**
+ * Read that form back.
+ *
+ * Parsed by hand rather than handed to `new Date(string)`: a bare
+ * `2026-08-15T09:30` is read as UTC by the specification, which would shift
+ * every appointment by the size of the time-zone offset.
+ *
+ * @returns {Date|null} null when the text is missing or not a real date —
+ *   31 February is rejected here rather than silently becoming 3 March.
+ */
+function parseLocalDateTime(text) {
+	const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(String(text || '').trim());
+	if (!m) return null;
+	const year = Number(m[1]);
+	const month = Number(m[2]) - 1;
+	const day = Number(m[3]);
+	const hour = Number(m[4]);
+	const minute = Number(m[5]);
+	/*
+	 * Two-digit years are a trap rather than a nicety: new Date(26, 0, 1)
+	 * means 1926, so "0026-01-01T09:00" would parse to a date that does not
+	 * format back to the text it came from. Nothing outside a plausible range
+	 * is accepted at all.
+	 */
+	if (year < 1970 || year > 9999) return null;
+	if (month < 0 || month > 11) return null;
+	if (day < 1 || day > daysInMonth(year, month)) return null;
+	if (hour > 23 || minute > 59) return null;
+	const d = new Date(year, month, day, hour, minute, 0, 0);
+	/* A DST spring-forward can swallow the chosen wall clock entirely. */
+	if (isNaN(d.getTime())) return null;
+	return d;
+}
+
+/**
+ * Add whole months, keeping the day of the month where it still exists.
+ *
+ * Counted from the original date every time rather than from the previous
+ * result, so a 31st survives a short month instead of being worn down by it:
+ * 31 Jan → 28 Feb → 31 Mar, not 31 Jan → 28 Feb → 28 Mar.
+ */
+function addMonthsLocal(date, n) {
+	const year = date.getFullYear();
+	const month = date.getMonth();
+	const target = new Date(year, month + n, 1);
+	const day = Math.min(date.getDate(), daysInMonth(target.getFullYear(), target.getMonth()));
+	return new Date(
+		target.getFullYear(), target.getMonth(), day,
+		date.getHours(), date.getMinutes(), 0, 0
+	);
+}
+
+/** Add whole days, rebuilt from components so the clock time survives DST. */
+function addDaysLocal(date, n) {
+	return new Date(
+		date.getFullYear(), date.getMonth(), date.getDate() + n,
+		date.getHours(), date.getMinutes(), 0, 0
+	);
+}
+
+/** The nth occurrence of a repeating appointment, counting the first as 0. */
+function scheduleOccurrence(anchor, repeat, n) {
+	if (repeat === 'daily') return addDaysLocal(anchor, n);
+	if (repeat === 'weekly') return addDaysLocal(anchor, n * 7);
+	if (repeat === 'monthly') return addMonthsLocal(anchor, n);
+	return new Date(anchor.getTime());
+}
+
+/**
+ * The first occurrence strictly later than `after`.
+ *
+ * Jumps most of the distance arithmetically and then walks, because the
+ * sequence is evenly spaced only in the daily and weekly cases — a month is
+ * 28 to 31 days, and an hour appears or vanishes twice a year. The walk is
+ * bounded: a schedule can be dormant for years, and no amount of neglect
+ * should turn a settings pane into an infinite loop.
+ *
+ * @returns {number|null} milliseconds, or null if it could not be resolved
+ */
+function nextOccurrenceAfter(anchor, repeat, after) {
+	if (repeat === 'once') {
+		return anchor.getTime() > after ? anchor.getTime() : null;
+	}
+
+	const anchorMs = anchor.getTime();
+	if (anchorMs > after) return anchorMs;
+
+	const stride =
+		repeat === 'weekly' ? 7 * DAY_MS : repeat === 'monthly' ? 28 * DAY_MS : DAY_MS;
+	let n = Math.floor((after - anchorMs) / stride);
+	if (n < 0) n = 0;
+
+	/* Undershoot deliberately, then step forward one at a time. */
+	for (let guard = 0; guard < 4000 && n > 0; guard++) {
+		if (scheduleOccurrence(anchor, repeat, n).getTime() <= after) break;
+		n--;
+	}
+	for (let guard = 0; guard < 4000; guard++) {
+		const t = scheduleOccurrence(anchor, repeat, n).getTime();
+		if (t > after) return t;
+		n++;
+	}
+	return null;
+}
+
+/**
+ * Fill in whatever is missing or nonsensical, so the rest of the plugin can
+ * trust the shape. Runs over settings written by an older version, by a hand
+ * edit of data.json, and by the settings pane mid-keystroke.
+ */
+function normalizeSchedule(raw) {
+	raw = raw || {};
+	const mode = scheduleMode(raw.mode).id;
+	const spec = scheduleMode(mode);
+
+	let every = Math.floor(Number(raw.every));
+	if (!isFinite(every) || every < 1) every = mode === 'minutes' ? 2 : 1;
+	if (spec.max && every > spec.max) every = spec.max;
+
+	/* Keep a chosen date even while another mode is selected, so switching
+	 * away and back does not throw away what the user picked. */
+	const at = parseLocalDateTime(raw.at) ? String(raw.at).trim() : '';
+
+	return {
+		mode: mode,
+		every: every,
+		at: at,
+		repeat: scheduleRepeat(raw.repeat).id,
+	};
+}
+
+/**
+ * The schedule for a settings object, upgrading the old one-number setting.
+ *
+ * Version 2.0 had a single "check GitHub every N minutes" box. Someone who
+ * had set that to 30 meant every 30 minutes, and must still get every 30
+ * minutes after updating — an upgrade that silently reverts a setting to its
+ * default is indistinguishable from a bug.
+ */
+function scheduleFromSettings(settings) {
+	settings = settings || {};
+	if (settings.githubSchedule && settings.githubSchedule.mode) {
+		return normalizeSchedule(settings.githubSchedule);
+	}
+	const legacy = Math.floor(Number(settings.githubPullMinutes));
+	return normalizeSchedule({
+		mode: 'minutes',
+		every: isFinite(legacy) && legacy > 0 ? legacy : 2,
+	});
+}
+
+/** How long an interval schedule waits. Zero for a date-and-time schedule. */
+function schedulePeriodMs(schedule) {
+	const s = normalizeSchedule(schedule);
+	const spec = scheduleMode(s.mode);
+	return spec.ms ? s.every * spec.ms : 0;
+}
+
+/**
+ * When the next check is due.
+ *
+ * @param {object} schedule
+ * @param {number} lastRun milliseconds of the last check, 0 if there has never been one
+ * @param {number} now
+ * @returns {number|null} when to check next, or null if nothing is scheduled —
+ *   which happens only for a one-off appointment that has already been kept.
+ *
+ * A time in the past is a real answer, not an error: it means the check is
+ * overdue, which is the normal state of affairs on a phone that has been in
+ * a pocket since yesterday. The caller runs it immediately, so a schedule
+ * missed while the app was closed is honoured on the next launch instead of
+ * being skipped to the following slot.
+ */
+function nextRunAt(schedule, lastRun, now) {
+	const s = normalizeSchedule(schedule);
+	lastRun = Number(lastRun) || 0;
+	now = Number(now) || 0;
+
+	/*
+	 * A stamp from the future is not information, it is a wrong clock — a
+	 * device set forward and then corrected, or a stamp copied in from
+	 * somewhere else. Trusting it would park the schedule for the whole of the
+	 * skew, with nothing in the interface able to release it.
+	 *
+	 * Discarded rather than clamped to `now`. Clamping only ever answers "one
+	 * period from now", so the check stays permanently five minutes away and
+	 * the bad stamp is never overwritten. Treating it as "never checked" makes
+	 * the check due at once, and the stamp it then writes is a real one — the
+	 * schedule repairs itself instead of limping.
+	 */
+	if (lastRun > now) lastRun = 0;
+
+	if (s.mode !== 'datetime') {
+		const period = schedulePeriodMs(s);
+		/* Never checked: due now, the same as the plugin has always behaved. */
+		if (!lastRun) return now;
+		return lastRun + period;
+	}
+
+	const anchor = parseLocalDateTime(s.at);
+	/* A date-and-time schedule with no date chosen yet checks nothing. */
+	if (!anchor) return null;
+
+	if (s.repeat === 'once') {
+		return lastRun >= anchor.getTime() ? null : anchor.getTime();
+	}
+	/* `lastRun - 1` so the anchor itself still counts the first time round. */
+	return nextOccurrenceAfter(anchor, s.repeat, lastRun ? lastRun : anchor.getTime() - 1);
+}
+
+/** "in 3 minutes", "in 2 days" — a rough distance, which is all this needs. */
+function formatDelay(ms) {
+	if (!isFinite(ms)) return '';
+	if (ms <= 0) return 'now';
+	if (ms < MINUTE_MS) return 'in under a minute';
+
+	/*
+	 * Rounded to the nearest unit, and promoted to the next one when that
+	 * rounding reaches its ceiling.
+	 *
+	 * Both halves earn their place. Rounding without the promotion prints "in
+	 * 60 minutes" and "in 24 hours", which are units this function has better
+	 * words for. Flooring avoids that but reads badly the other way: a check
+	 * an hour and fifty-nine minutes away is not "in 1 hour".
+	 */
+	const minutes = Math.round(ms / MINUTE_MS);
+	if (minutes < 60) return 'in ' + minutes + (minutes === 1 ? ' minute' : ' minutes');
+
+	const hours = Math.round(ms / HOUR_MS);
+	if (hours < 24) return 'in ' + hours + (hours === 1 ? ' hour' : ' hours');
+
+	const days = Math.round(ms / DAY_MS);
+	return 'in ' + days + (days === 1 ? ' day' : ' days');
+}
+
+/** "Sat 15 August 2026 at 09:30". Built by hand so it reads the same everywhere. */
+function formatWhen(ts) {
+	if (!ts) return '';
+	const d = new Date(ts);
+	if (isNaN(d.getTime())) return '';
+	return (
+		WEEKDAY_LONG[mondayIndex(d)].slice(0, 3) + ' ' +
+		d.getDate() + ' ' + MONTH_NAMES[d.getMonth()] + ' ' + d.getFullYear() +
+		' at ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes())
+	);
+}
+
+/** The schedule as one sentence, for the panel and the settings pane. */
+function describeSchedule(schedule) {
+	const s = normalizeSchedule(schedule);
+	const spec = scheduleMode(s.mode);
+
+	if (s.mode !== 'datetime') {
+		return 'every ' + (s.every === 1 ? spec.one : s.every + ' ' + spec.unit);
+	}
+
+	const anchor = parseLocalDateTime(s.at);
+	if (!anchor) return 'on a date and time — none chosen yet';
+
+	if (s.repeat === 'daily') {
+		return 'every day at ' + pad2(anchor.getHours()) + ':' + pad2(anchor.getMinutes());
+	}
+	if (s.repeat === 'weekly') {
+		return (
+			'every ' + WEEKDAY_LONG[mondayIndex(anchor)] +
+			' at ' + pad2(anchor.getHours()) + ':' + pad2(anchor.getMinutes())
+		);
+	}
+	if (s.repeat === 'monthly') {
+		return (
+			'on the ' + ordinal(anchor.getDate()) + ' of each month at ' +
+			pad2(anchor.getHours()) + ':' + pad2(anchor.getMinutes())
+		);
+	}
+	return 'once, on ' + formatWhen(anchor.getTime());
+}
+
+/** 1st, 2nd, 3rd, 4th … 11th, 21st. */
+function ordinal(n) {
+	const rem100 = n % 100;
+	if (rem100 >= 11 && rem100 <= 13) return n + 'th';
+	const rem10 = n % 10;
+	if (rem10 === 1) return n + 'st';
+	if (rem10 === 2) return n + 'nd';
+	if (rem10 === 3) return n + 'rd';
+	return n + 'th';
+}
+
+/**
+ * What to show under the setting: when the next check happens, in the words
+ * of someone looking at a calendar rather than a timer.
+ */
+function describeNextRun(schedule, lastRun, now) {
+	const next = nextRunAt(schedule, lastRun, now);
+	if (next === null) {
+		const s = normalizeSchedule(schedule);
+		if (s.mode === 'datetime' && !parseLocalDateTime(s.at)) {
+			return 'No date chosen yet, so nothing is scheduled.';
+		}
+		return 'That moment has passed and this schedule is finished. Pick another date and time.';
+	}
+	if (next <= now) return 'Next check: due now.';
+	return 'Next check: ' + formatWhen(next) + ' (' + formatDelay(next - now) + ').';
+}
+
+/* ================================================================== *
  * GITHUB — pure logic
  *
  * Everything in this block is I/O-free and unit-tested. The transport
@@ -1928,6 +2546,38 @@ const CORE = {
 	detectCloudFolder: detectCloudFolder,
 	shouldWarnAboutLocation: shouldWarnAboutLocation,
 	shouldRescanForChange: shouldRescanForChange,
+
+	/* check schedule */
+	scheduleMode: scheduleMode,
+	scheduleRepeat: scheduleRepeat,
+	normalizeSchedule: normalizeSchedule,
+	scheduleFromSettings: scheduleFromSettings,
+	schedulePeriodMs: schedulePeriodMs,
+	nextRunAt: nextRunAt,
+	nextOccurrenceAfter: nextOccurrenceAfter,
+	scheduleOccurrence: scheduleOccurrence,
+	describeSchedule: describeSchedule,
+	describeNextRun: describeNextRun,
+	daysInMonth: daysInMonth,
+	buildMonthGrid: buildMonthGrid,
+	dayKey: dayKey,
+	addMonthsLocal: addMonthsLocal,
+	addDaysLocal: addDaysLocal,
+	parseLocalDateTime: parseLocalDateTime,
+	formatLocalDateTime: formatLocalDateTime,
+	formatWhen: formatWhen,
+	formatDelay: formatDelay,
+	mondayIndex: mondayIndex,
+	ordinal: ordinal,
+	SCHEDULE_MODES: SCHEDULE_MODES,
+	SCHEDULE_REPEATS: SCHEDULE_REPEATS,
+	MONTH_NAMES: MONTH_NAMES,
+	WEEKDAY_SHORT: WEEKDAY_SHORT,
+	WEEKDAY_LONG: WEEKDAY_LONG,
+	MINUTE_MS: MINUTE_MS,
+	HOUR_MS: HOUR_MS,
+	DAY_MS: DAY_MS,
+
 	ECOSYSTEMS: ECOSYSTEMS,
 	LIVE_SCAN_DEBOUNCE_MS: LIVE_SCAN_DEBOUNCE_MS,
 	BEACON_DIR: BEACON_DIR,
@@ -2775,6 +3425,35 @@ function saveDeviceName(app, name) {
 	writeLocal(app, 'jemzsync-device-name', name);
 }
 
+/* ------------------- when this device last checked GitHub ------------------- *
+ *
+ * Per device, and for the same reason as everything else in this section: it
+ * is state, not a preference. Settings go through saveData, which writes
+ * .obsidian/plugins/jemzsync/data.json — a file inside the vault, which the
+ * ecosystem cloud then replicates to every other device.
+ *
+ * Keeping the stamp there would mean the Mac checking on Monday told the
+ * iPhone it had already checked, so a weekly schedule would be honoured once
+ * across the whole fleet rather than once per device. It would also rewrite a
+ * file in the vault on every single check — churn the cloud has to carry, and
+ * a real chance of the conflicted copies this very plugin exists to report.
+ *
+ * The *schedule* stays in settings, where the old "check every N minutes" box
+ * lived: that one is a preference, and sharing it across devices is the same
+ * behaviour people already have.
+ */
+const LAST_CHECK_KEY = 'jemzsync-last-check';
+
+function loadLastCheck(app) {
+	const n = Number(readLocal(app, LAST_CHECK_KEY));
+	return isFinite(n) && n > 0 ? n : 0;
+}
+
+function saveLastCheck(app, ts) {
+	const n = Math.floor(Number(ts) || 0);
+	writeLocal(app, LAST_CHECK_KEY, String(n > 0 ? n : 0));
+}
+
 /* ---------------------- paired device, per device ---------------------- *
  *
  * "The other device" is a different device depending on which one you are
@@ -3086,8 +3765,20 @@ function timeAgo(ts) {
 
 class JemzSyncPlugin extends Plugin {
 	async onload() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		const saved = await this.loadData();
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
+		/*
+		 * One path, deliberately. scheduleFromSettings already prefers a real
+		 * saved schedule and falls back to the old "check every N minutes"
+		 * box; deciding that again here only created a way for the two to
+		 * disagree — a saved `githubSchedule: {}` is truthy but says nothing,
+		 * and would have thrown the legacy value away.
+		 */
+		this.settings.githubSchedule = scheduleFromSettings(saved || {});
 		this.lastScan = null;
+		this.pullTimer = null;
+		/* Per device, and never written into the vault. See LAST_CHECK_KEY. */
+		this.lastCheckAt = loadLastCheck(this.app);
 		this.identity = loadDeviceIdentity(this.app);
 		this.pairing = loadPairing(this.app, this.settings);
 		this.github = loadGithubConfig(this.app);
@@ -3239,8 +3930,15 @@ class JemzSyncPlugin extends Plugin {
 	}
 
 	onunload() {
+		/*
+		 * Checked by the schedule timer before it re-arms. Without it, a
+		 * tick already in flight when the plugin is disabled would put the
+		 * next one on the clock and the chain would outlive the plugin.
+		 */
+		this.unloaded = true;
 		if (this.liveTimer) window.clearTimeout(this.liveTimer);
 		if (this.githubTimer) window.clearTimeout(this.githubTimer);
+		if (this.pullTimer) window.clearTimeout(this.pullTimer);
 		/* Obsidian detaches leaves, events and intervals registered above. */
 	}
 
@@ -3579,20 +4277,148 @@ class JemzSyncPlugin extends Plugin {
 		);
 	}
 
-	startGithubAutoSync() {
-		// Registered unconditionally; the mode is checked when it fires.
-		const minutes = Math.max(1, Number(this.settings.githubPullMinutes) || 5);
-		this.registerInterval(
-			window.setInterval(() => {
-				if (!this.githubReady()) return;
-				this.autoSync();
-			}, minutes * 60 * 1000)
-		);
+	/** The schedule as the rest of the plugin sees it: always a valid shape. */
+	checkSchedule() {
+		return scheduleFromSettings(this.settings);
+	}
 
-		this.app.workspace.onLayoutReady(() => {
-			if (!this.githubReady()) return;
-			this.autoSync();
-		});
+	/** When the next check is due, or null if the schedule is finished. */
+	nextCheckAt(now) {
+		return nextRunAt(
+			this.checkSchedule(),
+			this.lastCheckAt || 0,
+			now === undefined ? Date.now() : now
+		);
+	}
+
+	startGithubAutoSync() {
+		/*
+		 * The first check is not special-cased any more. It goes through the
+		 * schedule like every other one, which is the whole point of the
+		 * feature: someone who asked to be left alone for a week does not want
+		 * a check every time Obsidian opens. If the schedule *is* overdue —
+		 * the usual state on a phone — nextCheckAt returns a time in the past
+		 * and the timer fires straight away.
+		 */
+		this.app.workspace.onLayoutReady(() => this.armCheckTimer());
+	}
+
+	/**
+	 * Put the next check on the clock.
+	 *
+	 * Re-armed after every fire and after any settings change, so a new
+	 * schedule takes effect at once rather than after a restart.
+	 *
+	 * Two details that look like fussiness and are not:
+	 *
+	 * A timeout is capped at CHECK_TICK_MAX_MS rather than set for the full
+	 * wait. setTimeout takes a 32-bit signed delay, so anything beyond about
+	 * 24.8 days overflows and fires *immediately* — which would turn "every
+	 * month" into a tight loop. Waking briefly every few minutes to look at
+	 * the clock also survives a laptop lid being closed, a phone suspending
+	 * the app, and the clock being changed underneath us, none of which a
+	 * single long timeout survives.
+	 *
+	 * Precision is not lost: once the remaining wait fits inside the cap, the
+	 * timeout is set to exactly that.
+	 */
+	armCheckTimer(minWaitMs) {
+		if (this.pullTimer) {
+			window.clearTimeout(this.pullTimer);
+			this.pullTimer = null;
+		}
+		if (this.unloaded) return;
+
+		/*
+		 * Nothing to poll when the vault is not kept in a repository, which is
+		 * the default. Waking every minute to decide there is no repository
+		 * would be a background cost paid by everyone who never turns GitHub
+		 * on — on a phone, for nothing. Connecting a repository or changing
+		 * the storage mode calls restartCheckSchedule, so this comes back.
+		 */
+		if (!storageUsesGithub(this.github.mode)) return;
+
+		const now = Date.now();
+		const next = this.nextCheckAt(now);
+		/* A one-off appointment already kept. Nothing more to wait for. */
+		if (next === null) return;
+
+		let wait = Math.max(0, Math.min(next - now, CHECK_TICK_MAX_MS));
+		if (minWaitMs) wait = Math.max(wait, Math.min(minWaitMs, CHECK_TICK_MAX_MS));
+
+		this.pullTimer = window.setTimeout(() => {
+			this.pullTimer = null;
+			this.runScheduledCheck();
+		}, wait);
+	}
+
+	/**
+	 * The timer went off. Decide whether it is really time, then re-arm.
+	 *
+	 * The clock is consulted again rather than trusted from when the timeout
+	 * was set, because the capped timeout above means most firings are just
+	 * ticks with nothing to do.
+	 */
+	runScheduledCheck() {
+		if (this.unloaded) return;
+
+		const now = Date.now();
+		const next = this.nextCheckAt(now);
+		const due = next !== null && next <= now;
+		const check = due && this.githubReady() && this.settings.githubAutoSync;
+
+		/*
+		 * The re-arm is in a finally, and every fallible call below is wrapped.
+		 *
+		 * This chain is the only thing keeping the schedule alive: the timeout
+		 * callback clears pullTimer before running, so one thrown exception
+		 * anywhere in this method would leave zero live timers and no check
+		 * would ever happen again until Obsidian restarted. The old
+		 * implementation used setInterval, which survives a throwing callback
+		 * for free; a self-rearming chain has to earn that back.
+		 *
+		 * Due, but nothing to check — no repository, or automatic syncing
+		 * switched off — leaves the stamp alone, so a one-off appointment is
+		 * still waiting when GitHub comes back. That keeps the schedule
+		 * overdue, which would otherwise re-arm with a zero delay and spin,
+		 * hence the floor.
+		 */
+		try {
+			if (!check) return;
+
+			/*
+			 * Stamped before the sync rather than after, and stamped even if
+			 * the sync then fails. A failed check that left the stamp alone
+			 * would be due again on the very next tick, so a broken token or
+			 * an aeroplane would produce a check every few minutes for as long
+			 * as it lasted — the opposite of what a schedule is for. The error
+			 * is surfaced in the panel; the schedule holds its shape.
+			 */
+			this.lastCheckAt = now;
+			try {
+				saveLastCheck(this.app, now);
+			} catch (_) {
+				/* a full disk must not stop the checks */
+			}
+			try {
+				this.autoSync();
+			} catch (_) {
+				/* autoSync reports its own failures */
+			}
+			try {
+				this.refreshViews();
+			} catch (_) {
+				/* a torn-down panel is not a reason to stop checking */
+			}
+		} finally {
+			this.armCheckTimer(check ? 0 : due ? CHECK_IDLE_MS : 0);
+		}
+	}
+
+	/** Apply a schedule the user has just changed, without a restart. */
+	restartCheckSchedule() {
+		this.armCheckTimer();
+		this.refreshViews();
 	}
 
 	/** Debounced push after local edits settle. */
@@ -3606,6 +4432,10 @@ class JemzSyncPlugin extends Plugin {
 	 * devices stuck apart forever, which is the opposite of the point.
 	 */
 	autoSync(retriesLeft) {
+		/* Disabled mid-flight: the 1.5s retry below and the 2s settle timer in
+		 * syncWithGithub both outlive onunload, and neither should start a
+		 * fresh sync from a plugin that is no longer loaded. */
+		if (this.unloaded) return Promise.resolve(null);
 		const retries = retriesLeft === undefined ? 1 : retriesLeft;
 		return this.syncWithGithub({})
 			.then((r) => {
@@ -3909,6 +4739,35 @@ const HELP_TOPICS = {
 			'Clearing the field hands it back to automatic detection.',
 		],
 	},
+	schedule: {
+		title: 'Choosing when jemzsync checks GitHub',
+		intro:
+			'A check asks GitHub whether another device has committed anything, and pulls it down if so. Finding nothing costs three API requests out of the 5,000 an hour GitHub allows — actually fetching changes costs more, but only when there are changes to fetch. Either way the schedule is yours to set: this is about how quickly you want another device\'s work to appear, not about a limit.',
+		steps: [
+			'Whatever you choose, it loops. The check keeps happening on that schedule until you change it — you are setting the rhythm, not booking a single appointment. The one exception is spelled out on screen: "Just once, then stop".',
+			'Pick the kind of schedule first. The five interval kinds all mean the same thing in different units: wait this long after the last check, then check again, forever.',
+			'A minute, an hour, a day, a week and a month are fixed lengths here — a day is 24 hours, a week is 7 days, a month is 30 days. They count from the last check, so they drift relative to the calendar.',
+			'"On a date and time" is the one that follows the real calendar. Pick a moment from the calendar, then say whether it comes round every day, every week or every month. It starts on "every month on that date", because a date is what you picked and a date recurs monthly.',
+			'A schedule that came due while Obsidian was closed is honoured the next time you open it, rather than being skipped to the following slot. This matters most on a phone, which suspends the app whenever you put it down.',
+			'Whatever the schedule says, the Sync now button in the jemzsync panel checks immediately.',
+		],
+		tableTitle: 'What each choice means',
+		table: [
+			['Every so many minutes', 'shortest wait; another device\'s work appears soonest'],
+			['Every so many hours', 'a middle ground if you move between devices a few times a day'],
+			['Every so many days', 'counted as full 24-hour days from the last check'],
+			['Every so many weeks', 'counted as 7 days from the last check'],
+			['Every so many months', 'counted as 30 days from the last check, not as a calendar month'],
+			['On a date and time', 'a real calendar moment, optionally repeating daily, weekly or monthly'],
+		],
+		notes: [
+			'Sending is not on this schedule. Your own edits still go up about ten seconds after you stop typing, because an unsent edit is the half of the round trip that can lose work. The schedule governs receiving, which is a poll only because GitHub cannot notify a plugin.',
+			'Switching "Keep in sync automatically" off stops both halves. The schedule is then dormant until you switch it back on — a one-off date is not consumed while it is off.',
+			'A monthly repeat on the 29th, 30th or 31st falls back to the last day of any month too short to hold it: the 31st is the 28th in February, or the 29th in a leap year, and it returns to the 31st in March. The date you picked is never quietly rewritten.',
+			'The time is this device\'s local clock, and it is stored as a wall-clock time rather than an instant. Nine in the morning stays nine in the morning across a daylight-saving change or a flight to another time zone.',
+			'The schedule itself lives in this plugin\'s settings, which sit inside the vault — so if your vault is carried by iCloud or Google Drive, your devices end up sharing it, exactly as the old "check every N minutes" box did. What is kept per device is the record of when *this* device last checked, so a weekly schedule means weekly on each device rather than once between them.',
+		],
+	},
 	ssh: {
 		title: 'Why there is no SSH key field',
 		intro:
@@ -3926,6 +4785,313 @@ const HELP_TOPICS = {
 		],
 	},
 };
+
+/**
+ * Hang each option's one-line explanation off the option itself.
+ *
+ * A dropdown shows one line at a time, so the description under the setting
+ * can only ever explain the choice already made. This is a bonus where it
+ * works — Windows and Linux draw their own dropdowns and show the title on
+ * hover — and nothing at all where it does not: macOS hands the list to the
+ * system, and phones have no hover to begin with.
+ *
+ * So it is never the only explanation. The same sentence appears under the
+ * setting the moment a choice is made, and all of them together are in the
+ * help popup behind the "i" — those two are what the feature actually relies
+ * on, and both work on a phone.
+ *
+ * Guarded because a DropdownComponent only exposes selectEl in Obsidian
+ * proper — the test harness stands in with something simpler.
+ */
+function optionTooltips(dropdown, specs) {
+	try {
+		const select = dropdown && dropdown.selectEl;
+		if (!select || !select.options) return;
+		for (let i = 0; i < specs.length && i < select.options.length; i++) {
+			select.options[i].title = specs[i].help;
+		}
+	} catch (_) {
+		/* cosmetic only — never worth breaking a settings pane over */
+	}
+}
+
+/**
+ * Turn a text field into a number field.
+ *
+ * `inputmode` is the one that matters on a phone: it is what brings up the
+ * numeric keypad instead of the full keyboard for a box that can only hold
+ * digits. min and max stop the spinner on a computer from going out of range;
+ * the value is clamped again in normalizeSchedule regardless, because a
+ * typed-in value never touches the spinner.
+ */
+function numericField(text, min, max) {
+	try {
+		const el = text && text.inputEl;
+		if (!el) return;
+		el.type = 'number';
+		if (typeof el.setAttribute === 'function') {
+			el.setAttribute('inputmode', 'numeric');
+			el.setAttribute('min', String(min));
+			el.setAttribute('max', String(max));
+			el.setAttribute('step', '1');
+		}
+	} catch (_) {
+		/* a plain text box still works */
+	}
+}
+
+/**
+ * On leaving the box, show what was actually stored.
+ *
+ * Typing is left alone while it is happening — a field that rewrites itself
+ * under the cursor is unusable — so a moment can pass where the box reads 0
+ * or 9999 and the setting holds the clamped value instead. This closes that
+ * gap when the field loses focus, and puts back the last good number if the
+ * box was left empty.
+ */
+function snapToSavedValue(text, saved) {
+	try {
+		const el = text && text.inputEl;
+		if (!el || typeof el.addEventListener !== 'function') return;
+		el.addEventListener('blur', () => {
+			const settled = saved();
+			if (el.value !== settled) el.value = settled;
+		});
+	} catch (_) {
+		/* the field still works, it just may show what you typed */
+	}
+}
+
+/**
+ * Pick a date and a time.
+ *
+ * Built out of ordinary buttons rather than an `<input type="datetime-local">`
+ * for two reasons. The native control renders as a different thing on macOS,
+ * iOS and Android — including, on some Android builds, nothing usable at all
+ * inside Obsidian's webview — and it cannot be styled to match a theme. This
+ * draws the same calendar everywhere, sized so every day is a comfortable tap
+ * target on a phone.
+ *
+ * The month arithmetic is all in buildMonthGrid, which is tested: February
+ * has 28 days, or 29 in a leap year, and a month can need six rows.
+ */
+class DateTimePickerModal extends Modal {
+	constructor(app, initial, onPick) {
+		super(app);
+		this.onPick = onPick;
+
+		const start = initial && !isNaN(initial.getTime()) ? new Date(initial.getTime()) : null;
+		if (start) {
+			this.selected = start;
+		} else {
+			/* No previous choice: tomorrow at nine, which is a plausible
+			 * appointment rather than "one second ago". */
+			const now = new Date();
+			this.selected = new Date(
+				now.getFullYear(), now.getMonth(), now.getDate() + 1, 9, 0, 0, 0
+			);
+		}
+		this.viewYear = this.selected.getFullYear();
+		this.viewMonth = this.selected.getMonth();
+	}
+
+	onOpen() {
+		const el = this.contentEl;
+		el.empty();
+		el.addClass('jemzsync-modal');
+
+		el.createEl('h2', { text: 'Choose a date and time' });
+		el.createEl('p', {
+			cls: 'jemzsync-modal-detail',
+			text: 'The check runs at this moment on this device\'s clock. Carry the vault into another time zone and it still runs at the time shown here, not the one it used to be somewhere else.',
+		});
+
+		const cal = el.createDiv({ cls: 'jemzsync-cal' });
+
+		const nav = cal.createDiv({ cls: 'jemzsync-cal-nav' });
+		this.navButton(nav, '«', 'Back one year', () => this.page(-12));
+		this.navButton(nav, '‹', 'Back one month', () => this.page(-1));
+		this.titleEl = nav.createEl('div', { cls: 'jemzsync-cal-title' });
+		this.navButton(nav, '›', 'Forward one month', () => this.page(1));
+		this.navButton(nav, '»', 'Forward one year', () => this.page(12));
+
+		const head = cal.createDiv({ cls: 'jemzsync-cal-grid jemzsync-cal-weekdays' });
+		for (let i = 0; i < WEEKDAY_SHORT.length; i++) {
+			const cell = head.createEl('div', {
+				cls: 'jemzsync-cal-head' + (i >= 5 ? ' is-weekend' : ''),
+				text: WEEKDAY_SHORT[i],
+			});
+			if (typeof cell.setAttribute === 'function') {
+				cell.setAttribute('title', WEEKDAY_LONG[i]);
+			}
+		}
+
+		this.gridEl = cal.createDiv({ cls: 'jemzsync-cal-grid' });
+
+		new Setting(el)
+			.setName('Time')
+			.setDesc('On a 24-hour clock, so 14:30 is half past two in the afternoon.')
+			.addDropdown((d) => {
+				for (let h = 0; h < 24; h++) d.addOption(String(h), pad2(h) + ' h');
+				d.setValue(String(this.selected.getHours())).onChange((v) => {
+					this.selected.setHours(Number(v) || 0);
+					this.renderGrid();
+				});
+			})
+			.addDropdown((d) => {
+				for (let m = 0; m < 60; m++) d.addOption(String(m), pad2(m) + ' min');
+				d.setValue(String(this.selected.getMinutes())).onChange((v) => {
+					this.selected.setMinutes(Number(v) || 0);
+					this.renderGrid();
+				});
+			});
+
+		this.chosenEl = el.createEl('p', { cls: 'jemzsync-card-body' });
+
+		const row = el.createDiv({ cls: 'jemzsync-actions' });
+		this.useEl = row.createEl('button', { cls: 'mod-cta', text: 'Use this date' });
+		this.useEl.addEventListener('click', () => {
+			/* Belt and braces: the button is disabled for a past moment, but a
+			 * click already in flight must not slip one through. */
+			if (this.selected.getTime() <= Date.now()) return;
+			const picked = new Date(this.selected.getTime());
+			this.close();
+			if (this.onPick) this.onPick(picked);
+		});
+		row.createEl('button', { text: 'Today' }).addEventListener('click', () => {
+			const now = new Date();
+			this.selected = new Date(
+				now.getFullYear(), now.getMonth(), now.getDate(),
+				this.selected.getHours(), this.selected.getMinutes(), 0, 0
+			);
+			this.viewYear = now.getFullYear();
+			this.viewMonth = now.getMonth();
+			this.renderGrid();
+		});
+		row.createEl('button', { text: 'Cancel' }).addEventListener('click', () => this.close());
+
+		this.renderGrid();
+	}
+
+	navButton(parent, glyph, tooltip, onClick) {
+		const b = parent.createEl('button', { cls: 'jemzsync-cal-nav-btn', text: glyph });
+		if (typeof b.setAttribute === 'function') {
+			b.setAttribute('title', tooltip);
+			b.setAttribute('aria-label', tooltip);
+		}
+		b.addEventListener('click', onClick);
+		return b;
+	}
+
+	/** Move the visible month. Handed through a Date so December rolls over. */
+	page(months) {
+		const moved = new Date(this.viewYear, this.viewMonth + months, 1);
+		this.viewYear = moved.getFullYear();
+		this.viewMonth = moved.getMonth();
+		this.renderGrid();
+	}
+
+	renderGrid() {
+		if (!this.gridEl) return;
+		const now = Date.now();
+		const grid = buildMonthGrid(this.viewYear, this.viewMonth, now);
+		const todayCell = dayKey(new Date(now));
+		const selectedCell = dayKey(this.selected);
+
+		if (this.titleEl) this.titleEl.setText(grid.label);
+
+		this.gridEl.empty();
+		for (let r = 0; r < grid.weeks.length; r++) {
+			for (let c = 0; c < 7; c++) {
+				const cell = grid.weeks[r][c];
+				let cls = 'jemzsync-cal-day';
+				if (cell.weekend) cls += ' is-weekend';
+				if (!cell.inMonth) cls += ' is-outside';
+				if (cell.today) cls += ' is-today';
+				if (cell.key === selectedCell) cls += ' is-selected';
+
+				/*
+				 * Yesterday cannot be scheduled, so it is not offered. A past
+				 * date would either fire the instant the pane closed or, for a
+				 * repeat, silently mean something other than what it says.
+				 */
+				const past = cell.key < todayCell;
+				if (past) cls += ' is-past';
+
+				const btn = this.gridEl.createEl('button', {
+					cls: cls,
+					text: String(cell.day),
+				});
+				if (typeof btn.setAttribute === 'function') {
+					/*
+					 * Selected and today are shown with a fill and an outline,
+					 * which is colour alone. The label carries the same two
+					 * facts in words so a screen reader, or anyone who cannot
+					 * separate the accent colour from the background, is not
+					 * left guessing which day is which.
+					 */
+					btn.setAttribute(
+						'aria-label',
+						cell.day + ' ' + MONTH_NAMES[cell.month] + ' ' + cell.year +
+							(cell.key === selectedCell ? ', selected' : '') +
+							(cell.today ? ', today' : '')
+					);
+					if (cell.key === selectedCell) btn.setAttribute('aria-current', 'date');
+				}
+				if (past) {
+					btn.disabled = true;
+					continue;
+				}
+				btn.addEventListener('click', () => {
+					this.selected = new Date(
+						cell.year, cell.month, cell.day,
+						this.selected.getHours(), this.selected.getMinutes(), 0, 0
+					);
+					/* Tapping a greyed-out neighbouring day moves the month
+					 * too, otherwise the selection would vanish off-grid. */
+					this.viewYear = cell.year;
+					this.viewMonth = cell.month;
+					this.renderGrid();
+				});
+			}
+		}
+
+		/*
+		 * A moment already gone cannot be accepted.
+		 *
+		 * Not tidiness: "just once" decides it has been kept by comparing the
+		 * chosen moment against when this device last checked, so a moment
+		 * earlier than that last check would be born spent — the pane would
+		 * say the schedule was finished without ever having run it. Refusing
+		 * the input removes the whole class of confusion, and a schedule is
+		 * about the future in any case.
+		 */
+		const stamp = this.selected.getTime();
+		const gone = stamp <= now;
+
+		if (this.chosenEl) {
+			this.chosenEl.setText(
+				gone
+					? 'Chosen: ' + formatWhen(stamp) +
+						' — that has already passed. Pick a later time, or a later day.'
+					: 'Chosen: ' + formatWhen(stamp) + ' (' + formatDelay(stamp - now) + ')'
+			);
+		}
+		if (this.useEl) {
+			this.useEl.disabled = gone;
+			if (typeof this.useEl.setAttribute === 'function') {
+				this.useEl.setAttribute(
+					'title',
+					gone ? 'Pick a moment in the future' : 'Check at this moment'
+				);
+			}
+		}
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
 
 class HelpModal extends Modal {
 	constructor(app, topic) {
@@ -4318,12 +5484,14 @@ class JemzSyncView extends ItemView {
 		});
 
 		if (this.plugin.settings.githubAutoSync) {
+			const schedule = scheduleFromSettings(this.plugin.settings);
 			card.createEl('div', {
 				cls: 'jemzsync-meta',
-				text:
-					'Sending automatically after edits · checking every ' +
-					this.plugin.settings.githubPullMinutes +
-					' min',
+				text: 'Sending automatically after edits · checking ' + describeSchedule(schedule),
+			});
+			card.createEl('div', {
+				cls: 'jemzsync-meta',
+				text: describeNextRun(schedule, this.plugin.lastCheckAt || 0, Date.now()),
 			});
 		}
 	}
@@ -4680,6 +5848,12 @@ class JemzSyncSettingTab extends PluginSettingTab {
 				d.setValue(cfg.mode).onChange(async (v) => {
 					cfg.mode = v;
 					saveGithubConfig(this.plugin.app, cfg);
+					/* A vault that has just started using GitHub has nothing on
+					 * the clock yet, and one that has just stopped has a timer
+					 * with nothing left to do. */
+					if (typeof this.plugin.restartCheckSchedule === 'function') {
+						this.plugin.restartCheckSchedule();
+					}
 					await this.plugin.runScan(false);
 					this.display();
 				});
@@ -4731,6 +5905,7 @@ class JemzSyncSettingTab extends PluginSettingTab {
 						try {
 							const me = await this.plugin.connectGithub(this.pendingToken || '');
 							new Notice('Connected to GitHub as ' + me.login + '.');
+							this.plugin.restartCheckSchedule();
 							this.pendingToken = '';
 							this.display();
 						} catch (err) {
@@ -4748,6 +5923,7 @@ class JemzSyncSettingTab extends PluginSettingTab {
 			.addButton((b) =>
 				b.setButtonText('Disconnect').onClick(() => {
 					this.plugin.disconnectGithub();
+					this.plugin.restartCheckSchedule();
 					new Notice('Disconnected. The token has been removed from this device.');
 					this.display();
 				})
@@ -4814,19 +5990,7 @@ class JemzSyncSettingTab extends PluginSettingTab {
 				})
 			);
 
-		new Setting(containerEl)
-			.setName('Check GitHub every')
-			.setDesc('Minutes between checks for changes made on your other devices.')
-			.addText((t) =>
-				t
-					.setPlaceholder('5')
-					.setValue(String(this.plugin.settings.githubPullMinutes))
-					.onChange(async (v) => {
-						const n = parseInt(v, 10);
-						this.plugin.settings.githubPullMinutes = isNaN(n) ? 5 : Math.max(1, n);
-						await this.plugin.saveSettings();
-					})
-			);
+		this.displayCheckSchedule(containerEl);
 
 		new Setting(containerEl)
 			.setName('Notes only')
@@ -4839,6 +6003,179 @@ class JemzSyncSettingTab extends PluginSettingTab {
 					saveGithubConfig(this.plugin.app, cfg);
 				})
 			);
+	}
+
+	/**
+	 * When to check GitHub.
+	 *
+	 * Rendered into a container of its own so that changing the kind of
+	 * schedule can redraw just these few rows. Rebuilding the whole tab, which
+	 * is what the storage dropdown does, would throw away the scroll position
+	 * — and on a phone this section is a long way down.
+	 */
+	displayCheckSchedule(containerEl) {
+		/* A fresh container every time. The tab empties containerEl on
+		 * redisplay, so holding on to the old one would render into a div that
+		 * is no longer attached to anything. */
+		this.scheduleEl = containerEl.createDiv();
+		this.renderCheckSchedule();
+	}
+
+	/**
+	 * The schedule as it stands right now, as a fresh object.
+	 *
+	 * Every handler in this section reads through here rather than closing
+	 * over the copy that was current when the row was drawn. Typing a new
+	 * interval and then changing the kind of schedule would otherwise write
+	 * back the number from before the typing, quietly undoing it.
+	 *
+	 * Fresh, because Object.assign over it must not reach DEFAULT_SETTINGS.
+	 */
+	currentSchedule() {
+		return scheduleFromSettings(this.plugin.settings);
+	}
+
+	/** Persist a changed schedule and put it on the clock immediately. */
+	async saveSchedule(next, redraw) {
+		this.plugin.settings.githubSchedule = normalizeSchedule(next);
+		await this.plugin.saveSettings();
+		if (typeof this.plugin.restartCheckSchedule === 'function') {
+			this.plugin.restartCheckSchedule();
+		}
+		if (redraw) this.renderCheckSchedule();
+		else this.renderScheduleSummary();
+	}
+
+	renderCheckSchedule() {
+		const el = this.scheduleEl;
+		if (!el) return;
+		el.empty();
+
+		const s = scheduleFromSettings(this.plugin.settings);
+		const spec = scheduleMode(s.mode);
+
+		new Setting(el)
+			.setName('Check schedule')
+			.setDesc(spec.help)
+			.addDropdown((d) => {
+				for (let i = 0; i < SCHEDULE_MODES.length; i++) {
+					d.addOption(SCHEDULE_MODES[i].id, SCHEDULE_MODES[i].label);
+				}
+				optionTooltips(d, SCHEDULE_MODES);
+				d.setValue(s.mode).onChange(async (v) => {
+					await this.saveSchedule(Object.assign(this.currentSchedule(), { mode: v }), true);
+				});
+			})
+			.addExtraButton((b) =>
+				b
+					.setIcon('info')
+					.setTooltip('What each kind of schedule does')
+					.onClick(() => new HelpModal(this.app, 'schedule').open())
+			);
+
+		if (s.mode === 'datetime') this.renderDateTimeSchedule(el, s);
+		else this.renderIntervalSchedule(el, s, spec);
+
+		this.summaryEl = el.createEl('p', { cls: 'jemzsync-card-body' });
+		this.renderScheduleSummary();
+	}
+
+	/** The "every so many <units>" half: one number, and what it means. */
+	renderIntervalSchedule(el, s, spec) {
+		new Setting(el)
+			.setName('How many ' + spec.unit)
+			.setDesc(
+				/*
+				 * No sample sentence here. It was built at render time and
+				 * this box is not redrawn while it is being typed into, so it
+				 * sat contradicting the live summary immediately below it.
+				 */
+				'A whole number between 1 and ' + spec.max +
+					'. The wait is counted from when the last check began, and it repeats for ever.'
+			)
+			.addText((t) => {
+				t.setPlaceholder(String(s.every))
+					.setValue(String(s.every))
+					.onChange(async (v) => {
+						const n = parseInt(v, 10);
+						/* Half-typed input must not be "corrected" under the
+						 * cursor, so an empty or nonsense box is left alone
+						 * until it holds a number. */
+						if (isNaN(n)) return;
+						await this.saveSchedule(Object.assign(this.currentSchedule(), { every: n }));
+					});
+				numericField(t, 1, spec.max);
+				snapToSavedValue(t, () => String(this.currentSchedule().every));
+			})
+			.addExtraButton((b) =>
+				b.setIcon('info').setTooltip(spec.help).onClick(() => new HelpModal(this.app, 'schedule').open())
+			);
+	}
+
+	/** The calendar half: a moment, and whether it comes round again. */
+	renderDateTimeSchedule(el, s) {
+		const chosen = parseLocalDateTime(s.at);
+
+		new Setting(el)
+			.setName('Date and time')
+			.setDesc(
+				chosen
+					? formatWhen(chosen.getTime())
+					: 'No date chosen yet, so no check is scheduled. Open the calendar to pick one.'
+			)
+			.addButton((b) =>
+				b.setButtonText(chosen ? 'Change…' : 'Pick a date…').onClick(() => {
+					new DateTimePickerModal(this.app, chosen, async (picked) => {
+						await this.saveSchedule(
+							Object.assign(this.currentSchedule(), {
+								at: formatLocalDateTime(picked),
+							}),
+							true
+						);
+					}).open();
+				})
+			);
+
+		const repeat = scheduleRepeat(s.repeat);
+
+		new Setting(el)
+			.setName('Repeat')
+			.setDesc('The check keeps happening on this schedule until you change it. ' + repeat.help)
+			.addDropdown((d) => {
+				for (let i = 0; i < SCHEDULE_REPEATS.length; i++) {
+					d.addOption(SCHEDULE_REPEATS[i].id, SCHEDULE_REPEATS[i].label);
+				}
+				optionTooltips(d, SCHEDULE_REPEATS);
+				d.setValue(s.repeat).onChange(async (v) => {
+					await this.saveSchedule(Object.assign(this.currentSchedule(), { repeat: v }), true);
+				});
+			})
+			.addExtraButton((b) =>
+				b
+					.setIcon('info')
+					.setTooltip('How a repeat handles short months and leap years')
+					.onClick(() => new HelpModal(this.app, 'schedule').open())
+			);
+	}
+
+	/**
+	 * One line, kept current: what is scheduled, and when it next happens.
+	 *
+	 * This is the only place the schedule is spelled out in words, and it is
+	 * rewritten on every change including each keystroke in the number box.
+	 * The row descriptions above deliberately do not repeat it — they are
+	 * built when the section is drawn and would sit there contradicting this
+	 * line the moment anything was edited.
+	 */
+	renderScheduleSummary() {
+		if (!this.summaryEl) return;
+		const s = scheduleFromSettings(this.plugin.settings);
+		const last = this.plugin.lastCheckAt || 0;
+		this.summaryEl.setText(
+			'Checking ' + describeSchedule(s) + '. ' +
+				describeNextRun(s, last, Date.now()) +
+				(last ? ' Last checked ' + timeAgo(last) + '.' : ' Not checked yet.')
+		);
 	}
 
 	/**
@@ -4975,8 +6312,11 @@ module.exports.__device = {
 	classifyGithubHealth: classifyGithubHealth,
 	loadSyncBase: loadSyncBase,
 	saveSyncBase: saveSyncBase,
+	loadLastCheck: loadLastCheck,
+	saveLastCheck: saveLastCheck,
 	maskToken: maskToken,
 	GITHUB_KEYS: GITHUB_KEYS,
+	LAST_CHECK_KEY: LAST_CHECK_KEY,
 };
 
 /*
@@ -5009,6 +6349,7 @@ module.exports.__ui = {
 	JemzSyncSettingTab: JemzSyncSettingTab,
 	SetupModal: SetupModal,
 	HelpModal: HelpModal,
+	DateTimePickerModal: DateTimePickerModal,
 	HELP_TOPICS: HELP_TOPICS,
 };
 module.exports.VIEW_TYPE_JEMZSYNC = VIEW_TYPE_JEMZSYNC;

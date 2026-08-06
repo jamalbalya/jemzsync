@@ -214,6 +214,160 @@
 	gap: 8px;
 }
 
+/* --- date and time picker ---
+ *
+ * Sized for a thumb first. Apple asks for 44pt and Android for 48dp, and a
+ * seven-column grid on a 320px phone cannot give both dimensions that much —
+ * so the height is 44px, which is the one that is free, and the width is
+ * whatever a seventh of the modal comes to. That is the same compromise the
+ * system calendars make, and it is why the rows are generously spaced.
+ *
+ * Nothing here is allowed to overlap on a narrow screen. Every row is either
+ * a grid of fractional columns, which cannot overflow, or a flex row whose
+ * items are permitted to shrink — see the min-width: 0 below, without which
+ * a long month name would push the arrows off the edge.
+ */
+
+.jemzsync-cal {
+	margin: 0.75em 0 1em;
+	user-select: none;
+	-webkit-user-select: none;
+}
+
+.jemzsync-cal-nav {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	margin-bottom: 8px;
+}
+
+.jemzsync-cal-title {
+	/* min-width: 0 is what lets this shrink instead of shoving the arrows out
+	 * of the modal; the ellipsis is the visible sign it had to. */
+	flex: 1 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	text-align: center;
+	font-weight: var(--font-semibold);
+	font-size: var(--font-ui-medium);
+}
+
+.jemzsync-cal-nav-btn {
+	flex: 0 0 auto;
+	min-width: 44px;
+	min-height: 44px;
+	padding: 0;
+	font-size: var(--font-ui-medium);
+	line-height: 1;
+}
+
+.jemzsync-cal-grid {
+	display: grid;
+	/* Fractional columns, so seven cells always divide the width exactly and
+	 * the grid can never be wider than what contains it. */
+	grid-template-columns: repeat(7, 1fr);
+	gap: 2px;
+	/* A number too wide for its cell is clipped rather than allowed to spill
+	 * over the day beside it. */
+	overflow: hidden;
+}
+
+.jemzsync-cal-weekdays {
+	margin-bottom: 2px;
+}
+
+.jemzsync-cal-head {
+	text-align: center;
+	padding: 4px 0;
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+}
+
+.jemzsync-cal-day {
+	min-width: 0;
+	min-height: 44px;
+	padding: 0;
+	border-radius: var(--radius-s);
+	background: transparent;
+	box-shadow: none;
+	color: var(--text-normal);
+	font-size: var(--font-ui-small);
+	line-height: 1;
+	white-space: nowrap;
+	cursor: pointer;
+}
+
+.jemzsync-cal-day:hover:not(:disabled) {
+	background: var(--background-modifier-hover);
+}
+
+/* Weekends read as weekends, the way a wall calendar prints them. */
+.jemzsync-cal-head.is-weekend,
+.jemzsync-cal-day.is-weekend {
+	color: var(--color-red);
+}
+
+/* Ordered after the weekend rule on purpose: a day belonging to the month
+ * either side is faint whichever day of the week it happens to be. */
+.jemzsync-cal-day.is-outside {
+	color: var(--text-faint);
+}
+
+.jemzsync-cal-day.is-today {
+	box-shadow: inset 0 0 0 1px var(--interactive-accent);
+}
+
+.jemzsync-cal-day.is-selected,
+.jemzsync-cal-day.is-selected.is-weekend,
+.jemzsync-cal-day.is-selected.is-outside {
+	background: var(--interactive-accent);
+	color: var(--text-on-accent);
+	font-weight: var(--font-semibold);
+}
+
+/* A day that has already gone.
+ *
+ * The opacity is not stacked on top of the faint colour a neighbouring
+ * month's day already has: 0.35 of --text-faint was close enough to the
+ * background to be unreadable, so a past day from the month before appeared
+ * blank. Both cases are pinned to the same legible muted colour instead. */
+.jemzsync-cal-day:disabled,
+.jemzsync-cal-day.is-outside:disabled,
+.jemzsync-cal-day.is-weekend:disabled {
+	color: var(--text-faint);
+	opacity: 0.75;
+	cursor: default;
+}
+
+/* --- narrow screens ---
+ *
+ * A phone in portrait is the tightest case: a modal on a 320px iPhone SE
+ * leaves roughly 270px for seven columns. Trimming the gaps and the arrows
+ * buys back the width the day cells need, so nothing has to overlap or
+ * scroll sideways.
+ */
+@media (max-width: 400px) {
+	.jemzsync-cal-nav-btn {
+		min-width: 36px;
+	}
+
+	.jemzsync-cal-grid {
+		gap: 1px;
+	}
+
+	.jemzsync-cal-title {
+		font-size: var(--font-ui-small);
+	}
+}
+
+/* The hour and minute dropdowns sit in one settings row. On a narrow screen
+ * they wrap onto a second line rather than crowding each other. */
+.jemzsync-modal .setting-item-control {
+	flex-wrap: wrap;
+}
+
 /* GitHub repository picker */
 .jemzsync-repo-list {
 	max-height: 22em;
