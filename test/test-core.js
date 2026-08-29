@@ -2980,6 +2980,89 @@ async function githubTests() {
 		assert.ok(caught && /revoked|expired/i.test(caught.message), caught && caught.message);
 	});
 
+	await test('a branch name with a slash is a path, not an escape', async () => {
+		/*
+		 * `encodeURIComponent` on the whole ref turns `vault/main` into
+		 * `vault%2Fmain`, which real GitHub answers with 404. The plugin then
+		 * reports the branch as missing and offers to create one that is
+		 * already there. Checked on the wire rather than the outcome, because
+		 * a fake that decodes the path would hide exactly this.
+		 */
+		const gh = fakeGitHub();
+		const v = vaultOf({ 'a.md': 'alpha', 'b.md': 'beta' });
+		await G.githubSync(
+			G.githubClient('tok', gh.request, noSleep),
+			'o/r',
+			'vault/main',
+			v.io,
+			{ confirmed: true }
+		);
+
+		const refPaths = gh.requests
+			.filter((r) => /\/git\/refs?\//.test(r.path))
+			.map((r) => r.path);
+		assert.ok(refPaths.length >= 2, 'expected a read and a write: ' + refPaths.join(' '));
+		for (const path of refPaths) assert.strictEqual(path.indexOf('%2F'), -1, path);
+		assert.ok(
+			refPaths.some((path) => path.indexOf('/git/ref/heads/vault/main') !== -1),
+			refPaths.join(' ')
+		);
+		assert.deepStrictEqual(gh.filesOn('vault/main'), { 'a.md': 'alpha', 'b.md': 'beta' });
+	});
+
+	await test('the token is never sent to a host a Link header names', async () => {
+		/*
+		 * `paged` follows the absolute URL out of a `Link` header, and every
+		 * request carries the token in an Authorization header — so where that
+		 * URL may point is a security question. `api.github.com.evil.example`
+		 * starts with the API origin as a string and is a different host.
+		 */
+		const seen = [];
+		const linkTo = (target) => async (params) => {
+			seen.push(params.url);
+			return {
+				status: 200,
+				headers: { link: '<' + target + '>; rel="next"' },
+				text: '[]',
+			};
+		};
+
+		await assert.rejects(
+			() => G.githubClient('SECRET', linkTo('https://api.github.com.evil.example/user/repos?page=2'), noSleep).listRepos(),
+			/Refusing to send GitHub credentials/
+		);
+		// Downgrading to plain http would put the token on the wire in clear.
+		await assert.rejects(
+			() => G.githubClient('SECRET', linkTo('http://api.github.com/user/repos?page=2'), noSleep).listRepos(),
+			/Refusing to send GitHub credentials/
+		);
+
+		for (const url of seen) {
+			assert.strictEqual(url.indexOf('https://api.github.com/'), 0, url);
+		}
+	});
+
+	await test('paging stops even when GitHub keeps promising another page', async () => {
+		/*
+		 * Found by reverting the origin check above: the loop is bounded by
+		 * how many items it has collected, and a page that returns none while
+		 * still naming a next page can never reach that bound. The suite hung.
+		 * Real GitHub does not do this; a proxy or a captive portal can.
+		 */
+		let calls = 0;
+		const request = async () => {
+			calls++;
+			return {
+				status: 200,
+				headers: { link: '<https://api.github.com/user/repos?page=2>; rel="next"' },
+				text: '[]',
+			};
+		};
+		const repos = await G.githubClient('tok', request, noSleep).listRepos();
+		assert.deepStrictEqual(repos, []);
+		assert.ok(calls > 1 && calls <= 50, 'unbounded or never paged: ' + calls);
+	});
+
 	group('three-way merge — every outcome');
 
 	// base / local / remote, using distinct shas so the intent is readable.
@@ -3970,6 +4053,107 @@ async function githubTests() {
 		);
 	});
 
+	group('a remembered agreement belongs to one repository');
+
+	/*
+	 * The base is the only thing that can tell an edit from a deletion. Read
+	 * against the wrong repository it says every file the other repository
+	 * held was deleted elsewhere and should now be removed here — so pointing
+	 * the plugin at a second repository was one settings edit away from
+	 * trashing the whole vault.
+	 */
+	const baseCfg = { mode: 'github', token: 't', repo: 'me/vault-a', branch: 'main' };
+
+	await test('it is remembered while the repository and branch stay put', () => {
+		const app = fakeApp();
+		D.saveSyncBase(app, { 'Notes/A.md': 'sha-a' }, baseCfg);
+		assert.deepStrictEqual(
+			Object.assign({}, D.loadSyncBase(app, baseCfg)),
+			{ 'Notes/A.md': 'sha-a' }
+		);
+	});
+
+	await test('it is dropped the moment the repository changes', () => {
+		const app = fakeApp();
+		D.saveSyncBase(app, { 'Notes/A.md': 'sha-a' }, baseCfg);
+		const other = Object.assign({}, baseCfg, { repo: 'me/vault-b' });
+		assert.deepStrictEqual(Object.keys(D.loadSyncBase(app, other)), []);
+	});
+
+	await test('and the moment the branch changes, which is the same mistake', () => {
+		const app = fakeApp();
+		D.saveSyncBase(app, { 'Notes/A.md': 'sha-a' }, baseCfg);
+		const other = Object.assign({}, baseCfg, { branch: 'backup' });
+		assert.deepStrictEqual(Object.keys(D.loadSyncBase(app, other)), []);
+	});
+
+	await test('switching repository cannot turn a sync into a mass delete', () => {
+		const app = fakeApp();
+		const local = { 'Notes/A.md': 'sha-a', 'Notes/B.md': 'sha-b' };
+		D.saveSyncBase(app, local, baseCfg);
+
+		// Same repository, and an empty branch really does mean two deletions.
+		const remembered = C.buildSyncPlan(D.loadSyncBase(app, baseCfg), local, {});
+		assert.strictEqual(remembered.deleteLocal.length, 2);
+
+		// A different one, and there is nothing to remember. Both files are
+		// simply sent, which is what a first sync to a new repository is.
+		const other = Object.assign({}, baseCfg, { repo: 'me/vault-b' });
+		const safe = C.buildSyncPlan(D.loadSyncBase(app, other), local, {});
+		assert.strictEqual(safe.deleteLocal.length, 0);
+		assert.strictEqual(safe.push.length, 2);
+	});
+
+	await test('a base written before targets were tracked is adopted, not binned', () => {
+		// The upgrade path: throwing it away would make every existing device
+		// re-derive an agreement it already had.
+		const app = fakeApp();
+		app.saveLocalStorage(D.SYNC_BASE_KEY, JSON.stringify({ 'Notes/A.md': 'sha-a' }));
+		assert.strictEqual(app.loadLocalStorage(D.SYNC_BASE_TARGET_KEY), null);
+
+		assert.deepStrictEqual(
+			Object.assign({}, D.loadSyncBase(app, baseCfg)),
+			{ 'Notes/A.md': 'sha-a' }
+		);
+		// Adopted once, and now pinned like any other.
+		assert.deepStrictEqual(
+			Object.keys(D.loadSyncBase(app, Object.assign({}, baseCfg, { repo: 'me/other' }))),
+			[]
+		);
+	});
+
+	await test('disconnecting forgets it, so the next account starts clean', () => {
+		const app = fakeApp();
+		D.saveSyncBase(app, { 'Notes/A.md': 'sha-a' }, baseCfg);
+		D.clearSyncBase(app);
+		assert.deepStrictEqual(Object.keys(D.loadSyncBase(app, baseCfg)), []);
+	});
+
+	await test('a note named after an Object method is not read off the prototype', () => {
+		/*
+		 * A base straight out of JSON.parse carries Object.prototype, so a
+		 * path it does not hold — `toString`, `constructor` — answers with a
+		 * function instead of undefined. The file then looks like it moved on
+		 * both sides when only this one touched it. The plan still errs
+		 * safely; it just reports the wrong reason, which is exactly the sort
+		 * of wrong reason that sends someone hunting a sync bug that is not
+		 * there.
+		 */
+		const app = fakeApp();
+		D.saveSyncBase(app, { 'Notes/A.md': 'sha-a' }, baseCfg);
+		const base = D.loadSyncBase(app, baseCfg);
+		assert.strictEqual(base.toString, undefined);
+		assert.strictEqual(base.constructor, undefined);
+
+		// New here, never synced, absent there: an ordinary first push.
+		const local = Object.assign(Object.create(null), { toString: 'sha-l' });
+		const plan = C.buildSyncPlan(base, local, Object.create(null));
+		assert.strictEqual(plan.push.length, 1);
+		assert.strictEqual(plan.push[0].path, 'toString');
+		assert.strictEqual(plan.push[0].note, undefined);
+		assert.strictEqual(plan.conflict.length, 0);
+	});
+
 	group('the token must never leave this device');
 
 	await test('the token is written only to per-device storage', () => {
@@ -4324,10 +4508,12 @@ async function uiTests() {
 		return { sink: sink, plugin: p, tab: tab };
 	}
 
-	function renderPanel(ecosystem) {
+	function renderPanel(ecosystem, opts) {
+		opts = opts || {};
 		const sink = [];
 		const mod = loadWithFakeObsidian(sink);
-		const p = fakePluginFor(ecosystem, scan);
+		const p = fakePluginFor(ecosystem, opts.scan || scan, opts.pairing);
+		if (opts.github) Object.assign(p.github, opts.github);
 		const view = Object.create(mod.__ui.JemzSyncView.prototype);
 		view.plugin = p;
 		const root = fakeEl('div', null, sink);
@@ -4354,6 +4540,92 @@ async function uiTests() {
 				);
 			}
 		}
+	});
+
+	/* A scan of the same vault, classified for GitHub-only storage — which is
+	 * what runScan does, since the folder stops being the thing that can be
+	 * misconfigured once a repository is carrying the vault. */
+	function githubScan(ecosystem) {
+		const s = Object.assign({}, scan);
+		s.location = C.classifyVaultLocation('/Users/j/Notes', {
+			platform: 'desktop',
+			vaultName: 'Notes',
+			ecosystem: ecosystem,
+			storageMode: 'github',
+		});
+		s.devices = [];
+		return s;
+	}
+
+	await test('a GitHub-only vault is never told to wait for a cloud it does not use', () => {
+		/*
+		 * transportName has taken a storage mode since GitHub sync landed, and
+		 * not one caller passed it — so a Windows-and-Android pair syncing
+		 * through a repository was told to give Google Drive a few minutes.
+		 */
+		const text = renderPanel('windows', {
+			github: { mode: 'github', token: 'tok', repo: 'me/vault' },
+			scan: githubScan('windows'),
+			// A paired device that does not match is what produces the
+			// "wait a few minutes for ..." advice.
+			pairing: {
+				fingerprint: 'deadbeef-cafebabe',
+				fingerprintSource: 'auto',
+				label: 'Pixel',
+				labelSource: 'auto',
+				files: 5,
+				bytes: 500,
+			},
+		}).join('\n');
+
+		// The panel's own subtitle: what is carrying this vault.
+		assert.ok(/Last scan: [^\n]* · GitHub/.test(text), text);
+		// And the advice that named the wrong thing.
+		assert.ok(/Wait a few minutes for GitHub, then scan again/.test(text), text);
+		assert.strictEqual(text.indexOf('few minutes for Google Drive'), -1, text);
+	});
+
+	await test('including when the other device\'s digest was typed in by hand', () => {
+		/*
+		 * A hand-typed digest carries no file count, so the comparison takes
+		 * its own path with its own copy of the sentence — and its own copy of
+		 * the same mistake. Both are worth a test; one of them was passing on
+		 * the other's fix.
+		 */
+		const text = renderPanel('android', {
+			github: { mode: 'github', token: 'tok', repo: 'me/vault' },
+			scan: githubScan('android'),
+			pairing: {
+				fingerprint: 'deadbeef-cafebabe',
+				fingerprintSource: 'manual',
+				label: 'Laptop',
+				labelSource: 'manual',
+				files: 0,
+				bytes: 0,
+			},
+		}).join('\n');
+		assert.ok(/Wait a few minutes for GitHub, then scan again/.test(text), text);
+		assert.strictEqual(text.indexOf('few minutes for Google Drive'), -1, text);
+	});
+
+	await test('and is told plainly that its devices cannot announce themselves', () => {
+		// Beacons live in .jemzsync/, which REPO_ALWAYS_EXCLUDE never commits.
+		// Promising the other device will "appear here on its own" is a
+		// promise GitHub-only mode cannot keep.
+		const text = renderPanel('apple', {
+			github: { mode: 'github', token: 'tok', repo: 'me/vault' },
+			scan: githubScan('apple'),
+		}).join('\n');
+		assert.ok(/never committed to the repository/.test(text), text);
+		assert.strictEqual(text.indexOf('appears here on its own'), -1, text);
+	});
+
+	await test('cloud-and-GitHub still names the cloud, because it still carries the vault', () => {
+		const text = renderPanel('apple', {
+			github: { mode: 'both', token: 'tok', repo: 'me/vault' },
+		}).join('\n');
+		assert.ok(/iCloud Drive/.test(text), text);
+		assert.ok(/appears here on its own/.test(text), text);
 	});
 
 	await test('the panel names the right cloud for each ecosystem', () => {

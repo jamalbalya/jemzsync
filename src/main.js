@@ -2353,6 +2353,22 @@ function describeSyncPlan(plan) {
 	return bits.join(', ');
 }
 
+/**
+ * A ref path, encoded the way the Git Data API expects it.
+ *
+ * `encodeURIComponent` on the whole name is wrong here: a branch called
+ * `vault/main` becomes `vault%2Fmain`, which GitHub answers with 404 — the
+ * plugin then reports the branch as missing and offers to create it. Slashes
+ * are structure in a ref, so each segment is encoded on its own, exactly as
+ * `bootstrapBranch` already does for a file path.
+ */
+function encodeRefPath(branch) {
+	return String(branch || '')
+		.split('/')
+		.map(encodeURIComponent)
+		.join('/');
+}
+
 /** `owner/name`, tolerating a full URL or a trailing `.git`. */
 function parseRepoRef(text) {
 	const s = String(text || '')
@@ -2759,6 +2775,17 @@ function githubClient(token, request, sleep) {
 	async function call(method, path, body, opts) {
 		opts = opts || {};
 		const url = path.indexOf('http') === 0 ? path : GITHUB_API + path;
+		/*
+		 * Every request here carries the token in an Authorization header, so
+		 * where it is allowed to point is a security question, not a routing
+		 * one. `paged` follows the absolute URL out of a `Link` header, and an
+		 * absolute URL is exactly the thing that could name another host — or
+		 * plain http. Pinning it to the API origin means the token cannot
+		 * leave GitHub, whatever a response asks for.
+		 */
+		if (url.indexOf(GITHUB_API + '/') !== 0) {
+			throw new Error('Refusing to send GitHub credentials to ' + url);
+		}
 		let attempt = 0;
 
 		for (;;) {
@@ -2824,11 +2851,24 @@ function githubClient(token, request, sleep) {
 		}
 	}
 
-	/** Walk `Link: rel="next"` so a long list is never silently truncated. */
+	/*
+	 * Far more pages than any account has repositories. It exists only as a
+	 * backstop — see `paged`.
+	 */
+	const MAX_PAGES = 50;
+
+	/**
+	 * Walk `Link: rel="next"` so a long list is never silently truncated.
+	 *
+	 * Bounded by pages as well as by items. The item cap alone cannot stop a
+	 * response that names a next page while returning nothing: `out` never
+	 * grows, so the loop never ends and the plugin sits there requesting the
+	 * same page until Obsidian is closed.
+	 */
 	async function paged(path, limit) {
 		const out = [];
 		let next = path;
-		while (next && out.length < (limit || 1000)) {
+		for (let page = 0; next && page < MAX_PAGES && out.length < (limit || 1000); page++) {
 			const r = await call('GET', next);
 			if (!Array.isArray(r.json)) break;
 			for (let i = 0; i < r.json.length; i++) out.push(r.json[i]);
@@ -2872,7 +2912,7 @@ function githubClient(token, request, sleep) {
 		async getRef(repo, branch) {
 			const r = await call(
 				'GET',
-				'/repos/' + repo + '/git/ref/heads/' + encodeURIComponent(branch),
+				'/repos/' + repo + '/git/ref/heads/' + encodeRefPath(branch),
 				undefined,
 				{ allowMissing: true }
 			);
@@ -2976,7 +3016,7 @@ function githubClient(token, request, sleep) {
 		 * whatever the other device had just written.
 		 */
 		async updateRef(repo, branch, sha) {
-			await call('PATCH', '/repos/' + repo + '/git/refs/heads/' + encodeURIComponent(branch), {
+			await call('PATCH', '/repos/' + repo + '/git/refs/heads/' + encodeRefPath(branch), {
 				sha: sha,
 			});
 		},
@@ -3585,23 +3625,81 @@ function saveGithubConfig(app, cfg) {
  * then treats a difference on both sides as a conflict and keeps both copies,
  * which is the safe way to be wrong.
  */
-function loadSyncBase(app) {
-	const raw = readLocal(app, 'jemzsync-github-base');
+const SYNC_BASE_KEY = 'jemzsync-github-base';
+
+/*
+ * Which repository and branch the remembered base describes.
+ *
+ * A base is only meaningful against the branch it was read from. Point the
+ * plugin at a different repository — or a different branch of the same one —
+ * and every file the old branch held but the new one does not reads as
+ * "deleted over there, untouched here", which is precisely the shape
+ * `buildSyncPlan` answers by trashing the local copy. A vault was one
+ * settings edit away from being emptied into the trash.
+ *
+ * Storing the target alongside the base makes that impossible to get wrong:
+ * a base recorded against another target is simply not a base, and the sync
+ * falls back to having none — push what is here, pull what is there, keep
+ * both copies where they disagree. Slower, and never destructive.
+ */
+const SYNC_BASE_TARGET_KEY = 'jemzsync-github-base-target';
+
+function syncBaseTarget(cfg) {
+	return String((cfg && cfg.repo) || '') + '#' + String((cfg && cfg.branch) || '');
+}
+
+/**
+ * @param {object} app
+ * @param {object} [cfg] the GitHub config the base is being read for. Omit it
+ *   only where the target genuinely does not matter; the sync always passes it.
+ */
+function loadSyncBase(app, cfg) {
+	const raw = readLocal(app, SYNC_BASE_KEY);
 	if (!raw) return Object.create(null);
+
+	if (cfg) {
+		const want = syncBaseTarget(cfg);
+		const had = readLocal(app, SYNC_BASE_TARGET_KEY);
+		/*
+		 * No recorded target means a base written before this was tracked.
+		 * It belongs to whatever is configured now — nothing else could have
+		 * written it — so adopt it rather than throwing away a good base and
+		 * making every upgrading device re-derive one.
+		 */
+		if (!had) writeLocal(app, SYNC_BASE_TARGET_KEY, want);
+		else if (had !== want) return Object.create(null);
+	}
+
 	try {
 		const parsed = JSON.parse(raw);
-		return parsed && typeof parsed === 'object' ? parsed : Object.create(null);
+		if (!parsed || typeof parsed !== 'object') return Object.create(null);
+		/*
+		 * Copied onto a null prototype. Read straight from JSON.parse, a note
+		 * named `toString` or `constructor` inherits a function from
+		 * Object.prototype whenever the base does not hold it, so the lookup
+		 * never returns undefined and the file is classified as having moved
+		 * on both sides when only one of them touched it. The plan still
+		 * errs safely, but it reports the wrong reason for doing so.
+		 */
+		return Object.assign(Object.create(null), parsed);
 	} catch (_) {
 		return Object.create(null);
 	}
 }
 
-function saveSyncBase(app, base) {
+function saveSyncBase(app, base, cfg) {
 	try {
-		writeLocal(app, 'jemzsync-github-base', JSON.stringify(base));
+		writeLocal(app, SYNC_BASE_KEY, JSON.stringify(base));
+		if (cfg) writeLocal(app, SYNC_BASE_TARGET_KEY, syncBaseTarget(cfg));
 	} catch (_) {
 		/* quota — the next sync falls back to conflict-and-keep-both */
 	}
+}
+
+/** Forget the agreement entirely. Used when the repository is disconnected. */
+function clearSyncBase(app) {
+	writeLocal(app, SYNC_BASE_KEY, '');
+	writeLocal(app, SYNC_BASE_TARGET_KEY, '');
 }
 
 /** Never show a token in full; enough to recognise, not enough to use. */
@@ -4018,7 +4116,7 @@ class JemzSyncPlugin extends Plugin {
 				scan.fingerprint,
 				Date.now(),
 				BEACON_STALE_MS,
-				transportName(this.ecosystem)
+				transportName(this.ecosystem, this.github.mode)
 			);
 
 			this.autoNameThisDevice(split.others);
@@ -4122,6 +4220,12 @@ class JemzSyncPlugin extends Plugin {
 		this.github.lastCommit = '';
 		this.github.lastSyncAt = 0;
 		saveGithubConfig(this.app, this.github);
+		/*
+		 * The remembered agreement went with it. Keeping it would describe a
+		 * repository this device is no longer connected to, and the next one
+		 * it connects to would be compared against another repository's past.
+		 */
+		clearSyncBase(this.app);
 		this.refreshViews();
 	}
 
@@ -4176,7 +4280,7 @@ class JemzSyncPlugin extends Plugin {
 
 			assertScanComplete(scan);
 			const io = {
-				base: loadSyncBase(this.app),
+				base: loadSyncBase(this.app, this.github),
 				listLocal: async () => {
 					const collected = await collectPushable(
 						async () => scan.entries.map((e) => ({ path: e.path, size: e.size })),
@@ -4207,7 +4311,7 @@ class JemzSyncPlugin extends Plugin {
 				},
 				trash: (p) => trashPath(this.app, adapter, p),
 				saveBase: async (base, commit) => {
-					saveSyncBase(this.app, base);
+					saveSyncBase(this.app, base, this.github);
 					this.github.lastCommit = commit || '';
 					this.github.lastSyncAt = Date.now();
 					saveGithubConfig(this.app, this.github);
@@ -5297,7 +5401,12 @@ class JemzSyncView extends ItemView {
 				'Last scan: ' +
 				(scan ? timeAgo(scan.at) : 'never') +
 				' · ' +
-				ecosystemInfo(this.plugin.ecosystem).cloud +
+				/*
+				 * What is carrying the vault, not what ecosystem this device
+				 * belongs to. On a GitHub-only vault the panel's own subtitle
+				 * was announcing a cloud that is not involved at all.
+				 */
+				transportName(this.plugin.ecosystem, this.plugin.github.mode) +
 				(this.plugin.settings.watchVault ? ' · watching' : ''),
 		});
 
@@ -5318,7 +5427,7 @@ class JemzSyncView extends ItemView {
 				cls: 'jemzsync-empty',
 				text:
 					'Scan to check whether this vault is set up to sync across your devices through ' +
-					transportName(this.plugin.ecosystem) +
+					transportName(this.plugin.ecosystem, this.plugin.github.mode) +
 					'.',
 			});
 			return;
@@ -5357,14 +5466,23 @@ class JemzSyncView extends ItemView {
 
 		if (!devices.length) {
 			const eco = ecosystemInfo(this.plugin.ecosystem);
+			/*
+			 * The advice depends on whether an announcement can actually
+			 * travel. Beacons live in `.jemzsync/`, which REPO_ALWAYS_EXCLUDE
+			 * deliberately never commits, so in GitHub-only mode there is no
+			 * route for one — and telling that user to wait for a cloud they
+			 * are not using, for a device that will never appear, is worse
+			 * than saying nothing.
+			 */
 			card.createEl('p', {
 				cls: 'jemzsync-card-body',
-				text:
-					'No other devices seen yet. Enable jemzsync in this same vault on your ' +
-					eco.otherDevice +
-					' — each device announces itself through ' +
-					transportName(this.plugin.ecosystem) +
-					' and appears here on its own. The announcement travelling across is itself proof that sync is flowing.',
+				text: storageUsesCloud(this.plugin.github.mode)
+					? 'No other devices seen yet. Enable jemzsync in this same vault on your ' +
+					  eco.otherDevice +
+					  ' — each device announces itself through ' +
+					  transportName(this.plugin.ecosystem, this.plugin.github.mode) +
+					  ' and appears here on its own. The announcement travelling across is itself proof that sync is flowing.'
+					: 'No other devices listed, and in GitHub-only mode there will not be: a device announces itself by writing into the vault\'s .jemzsync folder, which is never committed to the repository. Compare the fingerprint below against your other device instead.',
 			});
 			return;
 		}
@@ -5577,14 +5695,18 @@ class JemzSyncView extends ItemView {
 			 */
 			const remote = { digest: paired.fingerprint, files: paired.files || 0 };
 			const cmp = paired.files
-				? compareFingerprints(remote, fp, transportName(this.plugin.ecosystem))
+				? compareFingerprints(
+						remote,
+						fp,
+						transportName(this.plugin.ecosystem, this.plugin.github.mode)
+				  )
 				: {
 						match: remote.digest === fp.digest,
 						summary:
 							remote.digest === fp.digest
 								? 'Match. That device holds the same files as this one.'
 								: 'No match — the two devices are holding different files. Wait a few minutes for ' +
-								  transportName(this.plugin.ecosystem) +
+								  transportName(this.plugin.ecosystem, this.plugin.github.mode) +
 								  ', then scan again.',
 				  };
 			card.createEl('div', {
@@ -6311,6 +6433,9 @@ module.exports.__device = {
 	classifyGithubHealth: classifyGithubHealth,
 	loadSyncBase: loadSyncBase,
 	saveSyncBase: saveSyncBase,
+	clearSyncBase: clearSyncBase,
+	SYNC_BASE_KEY: SYNC_BASE_KEY,
+	SYNC_BASE_TARGET_KEY: SYNC_BASE_TARGET_KEY,
 	loadLastCheck: loadLastCheck,
 	saveLastCheck: saveLastCheck,
 	maskToken: maskToken,
