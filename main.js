@@ -1,4 +1,4 @@
-/* jemzsync 2.1.1 — generated from src/main.js by build.js. Edit the source, not this file. */
+/* jemzsync 2.1.2 — generated from src/main.js by build.js. Edit the source, not this file. */
 'use strict';
 
 /*
@@ -2355,13 +2355,15 @@ function describeSyncPlan(plan) {
 }
 
 /**
- * A ref path, encoded the way the Git Data API expects it.
+ * A ref path, in the form GitHub itself uses.
  *
- * `encodeURIComponent` on the whole name is wrong here: a branch called
- * `vault/main` becomes `vault%2Fmain`, which GitHub answers with 404 — the
- * plugin then reports the branch as missing and offers to create it. Slashes
- * are structure in a ref, so each segment is encoded on its own, exactly as
- * `bootstrapBranch` already does for a file path.
+ * Both forms work — checked against the live API, `heads/vault%2Fmain` and
+ * `heads/vault/main` both resolve, and a genuinely absent ref still answers
+ * 404 either way. This sends the literal path because that is the shape
+ * GitHub returns in its own `url` fields, and it matches what
+ * `bootstrapBranch` already does for a file path. Do not read a bug fix into
+ * this: an earlier comment here claimed `%2F` returned 404, and that was
+ * simply wrong.
  */
 function encodeRefPath(branch) {
 	return String(branch || '')
@@ -2909,6 +2911,29 @@ function githubClient(token, request, sleep) {
 			return { full: r.json.full_name, defaultBranch: r.json.default_branch || 'main' };
 		},
 
+		/**
+		 * The branch head, and whether the repository has any commits at all.
+		 *
+		 * Those are two different kinds of absent and they need different
+		 * answers. A repository with no commits (409) rejects the whole Git
+		 * Data API and can only be written through the Contents API. A
+		 * repository that has commits but not *this* branch (404) is the
+		 * ordinary case of choosing a new branch name — and the Contents API
+		 * refuses that outright with "Branch <name> not found", because it
+		 * cannot create a branch. Conflating them is what made switching to a
+		 * new branch fail on any repository that was not empty.
+		 */
+		async readBranch(repo, branch) {
+			const r = await call(
+				'GET',
+				'/repos/' + repo + '/git/ref/heads/' + encodeRefPath(branch),
+				undefined,
+				{ allowMissing: true }
+			);
+			if (r.missing) return { sha: null, repoEmpty: r.status === 409 };
+			return { sha: r.json.object.sha, repoEmpty: false };
+		},
+
 		/** Head commit of a branch, or null when the branch does not exist. */
 		async getRef(repo, branch) {
 			const r = await call(
@@ -3150,8 +3175,18 @@ async function githubSync(client, repo, branch, io, opts) {
 	 * needs a real file to make the root commit out of — see bootstrapBranch
 	 * for why an empty repository cannot be written any other way.
 	 */
-	let headSha = await client.getRef(repo, branch);
-	if (!headSha && collected.files.length && !opts.dryRun) {
+	const head = await client.readBranch(repo, branch);
+	let headSha = head.sha;
+	/*
+	 * Only a repository with no commits at all needs the Contents API. Where
+	 * the repository has commits and merely lacks this branch, headSha stays
+	 * null and the ordinary path below does the right thing on its own: a tree
+	 * with no base, a commit with no parents, and createRef to put the branch
+	 * on it. Reaching for bootstrapBranch there answered "Branch <name> not
+	 * found" and the whole sync failed — every time someone typed a new branch
+	 * name into settings.
+	 */
+	if (!headSha && head.repoEmpty && collected.files.length && !opts.dryRun) {
 		const first = collected.files[0];
 		const bytes = await io.readBytes(first.path);
 		headSha = await client.bootstrapBranch(

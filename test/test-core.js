@@ -1528,6 +1528,18 @@ function fakeGitHub(opts) {
 		// The Contents API is the one endpoint that works in that state.
 		m = path.match(/^\/repos\/[^/]+\/[^/]+\/contents\/(.+)$/);
 		if (m && method === 'PUT') {
+			/*
+			 * The Contents API cannot create a branch. On a repository that
+			 * already has commits, writing to a branch that does not exist
+			 * answers 404 "Branch <name> not found" — verified against the
+			 * live API. The fake used to create the branch on demand, which
+			 * hid a real failure: choosing a new branch name in settings broke
+			 * every sync to a repository that was not empty.
+			 */
+			const target = body.branch || 'main';
+			if (Object.keys(state.refs).length && !state.refs[target]) {
+				return reply(404, { message: 'Branch ' + target + ' not found' });
+			}
 			const filePath = decodeURIComponent(m[1]).split('/').map(decodeURIComponent).join('/');
 			const blobSha = await C.gitBlobSha(C.base64ToBytes(body.content));
 			state.blobs[blobSha] = body.content;
@@ -2980,13 +2992,13 @@ async function githubTests() {
 		assert.ok(caught && /revoked|expired/i.test(caught.message), caught && caught.message);
 	});
 
-	await test('a branch name with a slash is a path, not an escape', async () => {
+	await test('a ref is sent as a path, in the form GitHub itself uses', async () => {
 		/*
-		 * `encodeURIComponent` on the whole ref turns `vault/main` into
-		 * `vault%2Fmain`, which real GitHub answers with 404. The plugin then
-		 * reports the branch as missing and offers to create one that is
-		 * already there. Checked on the wire rather than the outcome, because
-		 * a fake that decodes the path would hide exactly this.
+		 * Not a bug fix — both forms resolve against the live API, and an
+		 * earlier version of this comment claiming `%2F` returned 404 was
+		 * wrong. What is worth pinning is that a slashed branch works end to
+		 * end and that the request carries the canonical path form, since that
+		 * is what GitHub echoes back in its own `url` fields.
 		 */
 		const gh = fakeGitHub();
 		const v = vaultOf({ 'a.md': 'alpha', 'b.md': 'beta' });
@@ -3008,6 +3020,47 @@ async function githubTests() {
 			refPaths.join(' ')
 		);
 		assert.deepStrictEqual(gh.filesOn('vault/main'), { 'a.md': 'alpha', 'b.md': 'beta' });
+	});
+
+	await test('a new branch on a repository that already has commits', async () => {
+		/*
+		 * Found by running the engine against the real GitHub API. `getRef`
+		 * reported "missing" for two different situations — a repository with
+		 * no commits (409) and a repository that simply lacks this branch
+		 * (404) — and both were sent to bootstrapBranch, which writes through
+		 * the Contents API. That API cannot create a branch: it answers
+		 * "Branch <name> not found" and the sync dies. Anyone typing a new
+		 * branch name into settings hit it.
+		 */
+		const gh = fakeGitHub();
+		const first = vaultOf({ 'a.md': 'alpha' });
+		await G.githubSync(
+			G.githubClient('tok', gh.request, noSleep),
+			'o/r',
+			'main',
+			first.io,
+			{ confirmed: true }
+		);
+		assert.deepStrictEqual(gh.filesOn('main'), { 'a.md': 'alpha' });
+
+		// The repository is no longer empty. Now sync a different vault to a
+		// branch that does not exist yet.
+		const second = vaultOf({ 'b.md': 'beta', 'c.md': 'gamma' });
+		const res = await G.githubSync(
+			G.githubClient('tok', gh.request, noSleep),
+			'o/r',
+			'archive/2026',
+			second.io,
+			{ confirmed: true }
+		);
+		assert.strictEqual(res.applied, true, 'reason: ' + res.reason);
+		assert.deepStrictEqual(gh.filesOn('archive/2026'), { 'b.md': 'beta', 'c.md': 'gamma' });
+		// And the branch it was created beside is untouched.
+		assert.deepStrictEqual(gh.filesOn('main'), { 'a.md': 'alpha' });
+
+		// The Contents API is for empty repositories only; it must not appear.
+		const contents = gh.requests.filter((r) => /\/contents\//.test(r.path));
+		assert.strictEqual(contents.length, 1, 'contents calls: ' + contents.length);
 	});
 
 	await test('the token is never sent to a host a Link header names', async () => {
