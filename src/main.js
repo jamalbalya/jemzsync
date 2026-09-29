@@ -969,6 +969,27 @@ function buildMergedContent(originalText, copyText, meta) {
 }
 
 /**
+ * What to say when a scan could not read everything it tried to.
+ *
+ * A fingerprint is a claim about a whole vault. When a folder cannot be
+ * listed or a file cannot be stat'd, the digest is taken over what was
+ * readable and says nothing about the rest — so it will never match a device
+ * that read the vault properly. The panel then reported a permissions failure
+ * on this device as "wait a few minutes for your sync", which is advice that
+ * cannot work however long you wait. These errors were being collected and
+ * then dropped; this is the sentence that makes them visible.
+ */
+function describeScanErrors(errors) {
+	const n = (errors || []).length;
+	if (!n) return '';
+	return (
+		n + ' item' + (n === 1 ? '' : 's') + ' could not be read on this device, so this ' +
+		'fingerprint covers only part of the vault. A mismatch may be a local read ' +
+		'failure rather than a sync problem.'
+	);
+}
+
+/**
  * Extensions whose contents are plain text that a banner can be appended to
  * without breaking them.
  *
@@ -2656,6 +2677,7 @@ const CORE = {
 	findConflicts: findConflicts,
 	chooseWinner: chooseWinner,
 	buildMergedContent: buildMergedContent,
+	describeScanErrors: describeScanErrors,
 	isMergeableText: isMergeableText,
 	groupIsMergeable: groupIsMergeable,
 	conflictGroupPaths: conflictGroupPaths,
@@ -4900,15 +4922,38 @@ class JemzSyncPlugin extends Plugin {
 			};
 		}
 
+		/*
+		 * "Not there" and "there but unreadable" are different, and treating
+		 * them the same was destroying work.
+		 *
+		 * A conflicted copy can legitimately outlive its original, and merging
+		 * into an empty string is the right answer for that — it recreates the
+		 * note. But the same `catch` also swallowed a read that failed on a
+		 * file which certainly exists, and then wrote banner-plus-copy over
+		 * it: the original's entire contents replaced because one read went
+		 * wrong. The scan already knows which case this is.
+		 */
 		let text = '';
-		try {
-			text = await this.app.vault.adapter.read(group.original);
-		} catch (_) {
-			text = '';
+		if (scan.byPath[group.original]) {
+			try {
+				text = await this.app.vault.adapter.read(group.original);
+			} catch (err) {
+				return {
+					ok: false,
+					message:
+						'Could not read ' + group.original + ' (' +
+						String((err && err.message) || err) +
+						'), so nothing was merged and nothing was moved. Try again once the file is readable.',
+				};
+			}
 		}
 
 		const when = new Date().toISOString().slice(0, 16).replace('T', ' ');
 		let merged = 0;
+		/* A copy that cannot be read is skipped rather than merged — and, just
+		 * as importantly, is not trashed either. Counted so the result does not
+		 * claim to have dealt with it. */
+		let unreadable = 0;
 
 		for (let i = 0; i < group.copies.length; i++) {
 			const copyPath = group.copies[i].path;
@@ -4916,6 +4961,7 @@ class JemzSyncPlugin extends Plugin {
 			try {
 				copyText = await this.app.vault.adapter.read(copyPath);
 			} catch (_) {
+				unreadable++;
 				continue;
 			}
 			const result = buildMergedContent(text, copyText, {
@@ -4931,12 +4977,24 @@ class JemzSyncPlugin extends Plugin {
 
 		await this.app.vault.adapter.write(group.original, text);
 		await this.runScan(false);
+		/*
+		 * "Versions were identical" was said whenever nothing merged — including
+		 * when every copy had failed to read and been skipped. That is the
+		 * opposite of what happened: the copies are still there, untouched,
+		 * and the user was told they had been dealt with.
+		 */
+		const left =
+			unreadable > 0
+				? ' ' + unreadable + ' copy(s) could not be read and were left alone.'
+				: '';
 		return {
 			ok: true,
 			message:
-				merged > 0
+				(merged > 0
 					? 'Merged ' + merged + ' version(s) into ' + group.original + '.'
-					: 'Versions were identical — kept one copy.',
+					: unreadable > 0 && unreadable === group.copies.length
+					? 'Nothing was merged.'
+					: 'Versions were identical — kept one copy.') + left,
 		};
 	}
 }
@@ -5944,6 +6002,23 @@ class JemzSyncView extends ItemView {
 			cls: 'jemzsync-meta',
 			text: fp.files + ' files · ' + formatBytes(fp.bytes),
 		});
+
+		/*
+		 * Said before any comparison below it. A digest taken over a vault
+		 * that could not be fully read will never match one taken over the
+		 * whole of it, and the comparison's own advice — wait for the cloud,
+		 * scan again — is then wrong in a way no amount of waiting fixes.
+		 */
+		const scanTrouble = describeScanErrors(scan.errors);
+		if (scanTrouble) {
+			card.createEl('div', { cls: 'jemzsync-compare is-warn', text: scanTrouble });
+			const list = card.createEl('ul', { cls: 'jemzsync-list' });
+			for (let i = 0; i < Math.min(5, scan.errors.length); i++) {
+				list.createEl('li', {
+					text: scan.errors[i].path + ' — ' + scan.errors[i].message,
+				});
+			}
+		}
 
 		const row = card.createDiv({ cls: 'jemzsync-actions' });
 		const copyBtn = row.createEl('button', { text: 'Copy' });

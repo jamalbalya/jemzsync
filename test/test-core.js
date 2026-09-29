@@ -605,6 +605,78 @@ async function conflictTests() {
 		assert.deepStrictEqual(v.trashed, ['Plan 2.md']);
 	});
 
+	await test('an original that exists but will not read is NEVER overwritten', async () => {
+		/*
+		 * The destructive path: "not there" and "there but unreadable" went
+		 * through one `catch` that produced an empty string, and the merge
+		 * then wrote banner-plus-copy over the original — its entire contents
+		 * replaced because one read failed. A conflicted copy outliving its
+		 * original is the case that catch was for, and it still works; this
+		 * one must abort instead.
+		 */
+		const v = fakeConflictVault({
+			'Plan.md': Buffer.from('work that must survive', 'utf8'),
+			'Plan 2.md': Buffer.from('from the phone', 'utf8'),
+		});
+		v.plugin.app.vault.adapter.read = async (p) => {
+			if (p === 'Plan.md') throw new Error('EBUSY');
+			return Buffer.from(v.files[p]).toString('utf8');
+		};
+
+		const res = await v.plugin.resolveMerge({
+			original: 'Plan.md',
+			copies: [{ path: 'Plan 2.md' }],
+		});
+		assert.strictEqual(res.ok, false);
+		assert.ok(/EBUSY/.test(res.message), res.message);
+		assert.strictEqual(
+			v.files['Plan.md'].toString('utf8'),
+			'work that must survive',
+			'the original must be untouched'
+		);
+		assert.deepStrictEqual(v.trashed, [], 'and nothing may be trashed');
+	});
+
+	await test('but a copy that outlived its original still merges into a new note', async () => {
+		const v = fakeConflictVault({
+			'Plan (conflicted copy 2026-08-01).md': Buffer.from('all that is left', 'utf8'),
+		});
+		const res = await v.plugin.resolveMerge({
+			original: 'Plan.md',
+			originalExists: false,
+			copies: [{ path: 'Plan (conflicted copy 2026-08-01).md' }],
+		});
+		assert.strictEqual(res.ok, true);
+		assert.ok(v.files['Plan.md'].toString('utf8').indexOf('all that is left') !== -1);
+	});
+
+	await test('an unreadable copy is left alone, and not reported as dealt with', async () => {
+		// "Versions were identical — kept one copy" was said even when every
+		// copy had failed to read and was still sitting there.
+		const v = fakeConflictVault({
+			'Plan.md': Buffer.from('mine', 'utf8'),
+			'Plan 2.md': Buffer.from('theirs', 'utf8'),
+		});
+		v.plugin.app.vault.adapter.read = async (p) => {
+			if (p === 'Plan 2.md') throw new Error('EBUSY');
+			return Buffer.from(v.files[p]).toString('utf8');
+		};
+
+		const res = await v.plugin.resolveMerge({
+			original: 'Plan.md',
+			copies: [{ path: 'Plan 2.md' }],
+		});
+		assert.strictEqual(res.ok, true);
+		assert.ok(/could not be read and were left alone/.test(res.message), res.message);
+		assert.strictEqual(
+			/identical/.test(res.message),
+			false,
+			'it must not claim the versions matched: ' + res.message
+		);
+		assert.deepStrictEqual(v.trashed, [], 'an unmerged copy must survive');
+		assert.strictEqual(v.files['Plan.md'].toString('utf8'), 'mine');
+	});
+
 	await test('merging an attachment is refused rather than attempted', async () => {
 		const original = Buffer.from([0x25, 0x50, 0x44, 0x46, 0xff, 0xfe]);
 		const v = fakeConflictVault({
@@ -4920,6 +4992,43 @@ async function uiTests() {
 		view.render();
 		return sink;
 	}
+
+	await test('a vault that could not be fully read says so, instead of blaming sync', async () => {
+		/*
+		 * A folder that will not list leaves its files out of the digest, so
+		 * the fingerprint can never match a device that read the whole vault.
+		 * The comparison's own advice — wait for the cloud, scan again — is
+		 * then wrong in a way no amount of waiting fixes, and these errors
+		 * were being collected by the scanner and then dropped on the floor.
+		 */
+		const partial = await C.scanVault(
+			{
+				async list(dir) {
+					if (dir === '/') return { files: ['a.md'], folders: ['Private'] };
+					if (dir === 'Private') throw new Error('EPERM: operation not permitted');
+					return { files: [], folders: [] };
+				},
+				async stat() {
+					return { size: 10, mtime: 1 };
+				},
+			},
+			C.DEFAULT_SETTINGS
+		);
+		assert.strictEqual(partial.errors.length, 1, 'the scanner must record it');
+		partial.location = scan.location;
+		partial.devices = [];
+		partial.at = Date.now();
+
+		const text = renderPanel('apple', { scan: partial }).join('\n');
+		assert.ok(/covers only part of the vault/.test(text), 'the panel must say so:\n' + text);
+		assert.ok(/local read failure rather than a sync problem/.test(text), text);
+		assert.ok(/EPERM/.test(text), 'and name the actual failure:\n' + text);
+	});
+
+	await test('a vault that read cleanly says nothing about read errors', async () => {
+		const text = renderPanel('apple').join('\n');
+		assert.strictEqual(text.indexOf('covers only part of the vault'), -1, text);
+	});
 
 	await test('both cards agree on WHICH device is holding more files', () => {
 		/*
