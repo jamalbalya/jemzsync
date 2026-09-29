@@ -39,6 +39,13 @@ jobs:
       - name: Run test suite
         run: npm test
 
+      # The README makes checkable claims — command names, counts, which
+      # version a change shipped in, what is never pushed. Each of those has
+      # been wrong at least once, so they are derived from the code rather
+      # than trusted.
+      - name: Verify the documentation still matches the code
+        run: npm run test:docs
+
       - name: Verify the tests would catch a regression
         run: npm run test:mutation
 

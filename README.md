@@ -147,8 +147,10 @@ When two devices edit the same note before seeing each other, iCloud keeps both 
 
 jemzsync lists each one and gives you two choices:
 
-- **Keep newest** — keeps the most recently modified version and moves the others to Obsidian's trash. On a tie, the larger file wins; on a full tie, the original.
+- **Keep newest** — keeps the most recently modified version and moves the others to Obsidian's trash. On a tie, the larger file wins; on a full tie, the original. The chosen version is copied byte for byte, so this works on attachments — images, PDFs, recordings — exactly as it does on notes.
 - **Merge both** — appends the other version to the original under a clearly marked banner, so you can decide by hand. Nothing is discarded.
+
+**Merge both is offered only for notes and plain text** (`.md`, `.markdown`, `.txt`). Appending one version of a PNG, a PDF or a `.canvas` to another does not merge them, it produces a file nothing can open — so for those the button is simply not drawn, and Keep newest is the resolution. If a duplicate is the only copy left, because the original was deleted, Keep newest restores it to the original name.
 
 Both send removed files to the trash rather than deleting them, so a wrong choice is recoverable.
 
@@ -163,9 +165,10 @@ Open the command palette and search for jemzsync.
 | Command | What it does |
 |---|---|
 | Open panel | Opens the sidebar |
-| Check iCloud setup | Scans and reports whether the vault is in the right place |
+| Check sync setup | Scans and reports whether the vault is in the right place |
 | Scan for sync conflicts | Looks for duplicate copies |
 | Copy vault fingerprint | Copies the fingerprint for comparison |
+| Sync vault with GitHub | Runs a two-way sync now. Only offered when GitHub storage is set up |
 
 There is also a cloud icon in the left ribbon and a status bar summary.
 
@@ -180,7 +183,7 @@ There is also a cloud icon in the left ribbon and a status bar summary.
 | Watch the vault while Obsidian runs | On | Rescans a few seconds after anything changes, including files arriving from the cloud. Needs a restart |
 | Warn when the vault cannot sync | On | Popup on launch if the vault is somewhere the cloud cannot reach |
 | Scan when Obsidian starts | On | Checks the vault on launch |
-| Scan every | 15 minutes | Background scans. 0 means on demand only |
+| Scan every | 15 minutes | Background scans. 0 means on demand only. Needs a restart |
 | Notify about conflicts | On | Shows a notice when duplicates appear |
 | Show status bar item | On | One-line summary. Needs a restart |
 | Other device fingerprint | Detected | Filled in from the other device's announcement. Editable; clear it to re-enable detection |
@@ -248,6 +251,7 @@ Several rules worth stating plainly, because each one exists because the alterna
 
 - **An edit always beats a delete.** If you delete a note on one device while editing it on another, the edit survives. Losing writing is unrecoverable; an unexpectedly resurrected file is not.
 - **A file that cannot be read is never treated as deleted.** It is reported and left exactly as it is, on both sides.
+- **A file too large to upload is never quietly absent.** It is skipped, named on screen, and never mistaken for a file that synced.
 - **A file the cloud has offloaded is not a deleted file.** iCloud replaces contents with a `.icloud` stub whenever it wants disk space back; those are treated as present-but-unreadable, never as gone.
 - **Deletes are always recoverable.** They go to Obsidian's trash, and if Obsidian does not yet know about the file, into the vault's own `.trash` folder. Nothing is ever removed outright.
 - **The branch is never force-pushed.** If another device committed first, the push is refused and the two sides are merged instead.
@@ -259,7 +263,9 @@ Several rules worth stating plainly, because each one exists because the alterna
 
 Your notes and attachments, and by default the rest of `.obsidian/` — themes, snippets and other plugins — so a new device comes up already configured. Switch on **Notes only** to send just the markdown.
 
-Four things are never sent, whatever the setting: any plugin's `data.json` (they hold API keys), `.obsidian/workspace*` (per-device layout), the `.jemzsync` announcements, and jemzsync's own files. That last one is deliberate: Obsidian's developer policy forbids a plugin distributing or updating itself, so a device in GitHub-only mode needs jemzsync installed by hand.
+**Files larger than 40 MB are not sent.** GitHub refuses anything over 100 MB and grows unreliable well before that, and uploading holds the file and its base64 encoding in memory at once — which a phone will not survive. Skipping one file beats failing the whole sync, so jemzsync skips it and **says so**: the file is named in the GitHub card and in the confirmation screen, with the reason. In GitHub-only mode the repository is your only copy, so treat that line as a warning to keep the file somewhere else too.
+
+Some things are never sent, whatever the setting: any plugin's `data.json` (they hold API keys), `.obsidian/workspace*` (per-device layout), the `.jemzsync` announcements, jemzsync's own files, and the housekeeping nobody wants in a repository — `.trash/`, `.git/`, `.DS_Store` and iCloud's `.icloud` placeholder stubs. The fourth is deliberate: Obsidian's developer policy forbids a plugin distributing or updating itself, so a device in GitHub-only mode needs jemzsync installed by hand. The full list is in the Privacy section below, and every rule in it is asserted by a test.
 
 ### Authentication: a token, not an SSH key
 
@@ -331,7 +337,7 @@ One thing this must never do is react to its own beacon. Writing a beacon is a v
 
 Obsidian's automated review flags both of these. Neither is accidental.
 
-**Clipboard.** The plugin writes to the clipboard, never reads it. It happens only when you press a button: **Copy** on the fingerprint, **Copy commands** on the migration steps, or the *Copy vault fingerprint* command. What lands there is a sixteen-character digest or a block of shell commands. Nothing is read back, and nothing is copied without a click.
+**Clipboard.** The plugin writes to the clipboard, never reads it. It happens only when you press a button: **Copy** on the fingerprint, **Copy commands** on the migration steps, or the *Copy vault fingerprint* command. What lands there is a short digest such as `a1b2c3d4-e5f6a7b8`, or a block of shell commands. Nothing is read back, and nothing is copied without a click.
 
 **Per-device state kept out of `saveData`.** Obsidian's `saveData` writes into the vault — and this vault is being replicated by iCloud or Google Drive, which is the entire point of the plugin. Two pieces of state must *not* travel:
 
@@ -340,9 +346,9 @@ Obsidian's automated review flags both of these. Neither is accidental.
 
 Both go through `app.saveLocalStorage` / `app.loadLocalStorage`, Obsidian's own API for exactly this: stored on the device, never synced, and scoped per vault — so two vaults open on the same Mac get separate identities rather than quietly sharing one. Everything that *should* be shared — scan preferences, exclusions — goes through `saveData` as normal.
 
-- **The paired device's fingerprint and name.** These moved out of `saveData` in 1.4.0, when they started filling themselves in. "The other device" is a different device depending on which one you are standing at, so a single shared value cannot be right for both. Worse, it could never settle: the Mac would write the iPhone's digest into the shared file, iCloud would carry it to the iPhone, which would overwrite it with the Mac's — and because that file lives in the vault, every one of those writes changed the fingerprint the two devices were trying to match on.
+- **The paired device's fingerprint and name.** These moved out of `saveData` in 2.0.1, when they started filling themselves in. "The other device" is a different device depending on which one you are standing at, so a single shared value cannot be right for both. Worse, it could never settle: the Mac would write the iPhone's digest into the shared file, iCloud would carry it to the iPhone, which would overwrite it with the Mac's — and because that file lives in the vault, every one of those writes changed the fingerprint the two devices were trying to match on.
 
-Nine tests drive this against a fake app, including that two vaults never collide, that a dismissal in one does not silence another, and that a build without the storage API degrades to an ephemeral ID instead of throwing.
+A section of the suite drives this against a fake app, including that two vaults never collide, that a dismissal in one does not silence another, and that a build without the storage API degrades to an ephemeral ID instead of throwing.
 
 ---
 
@@ -354,9 +360,11 @@ cd jemzsync
 npm test
 ```
 
-327 tests and zero dependencies. The suite covers vault-location detection, the migration plan, conflict grouping and resolution, fingerprinting, device beacons, pairing auto-fill, device naming, ecosystem-neutral wording, and the scanner driven by a fake adapter — including end-to-end simulations of a Mac beacon being read on an iPhone for both the matching and the missing-note case.
+450 tests and zero dependencies. The suite covers vault-location detection, the migration plan, conflict grouping and resolution, fingerprinting, device beacons, pairing auto-fill, device naming, ecosystem-neutral wording, and the scanner driven by a fake adapter — including end-to-end simulations of a Mac beacon being read on an iPhone for both the matching and the missing-note case.
 
-The suite is itself verified by mutation testing (`npm run test:mutation`): 77 deliberate regressions are injected into a temporary copy of the source and all 77 must be caught — including an infinite-loop hang, an auto-filled field overwriting something you typed, Apple wording creeping back into a screen every platform sees, a force-push that would erase another device, an offloaded file being mistaken for a deleted one, and a delete falling back to a permanent removal instead of the trash.
+The README is checked too (`npm run test:docs`): command names, the counts quoted here, the versions cited in the prose and every path promised as never-pushed are derived from the code rather than taken on trust, because each of those has been wrong at least once. The release workflow runs it before publishing.
+
+The suite is itself verified by mutation testing (`npm run test:mutation`): 120 deliberate regressions are injected into a temporary copy of the source and all 120 must be caught — including an infinite-loop hang, an auto-filled field overwriting something you typed, Apple wording creeping back into a screen every platform sees, a force-push that would erase another device, an offloaded file being mistaken for a deleted one, and a delete falling back to a permanent removal instead of the trash.
 
 Layout:
 
@@ -368,6 +376,8 @@ manifest.json       plugin metadata
 styles.css          panel styling via Obsidian theme variables
 test/test-core.js   test suite
 test/mutation.js    mutation testing of the suite itself
+test/mutations.js   the regressions that testing injects, one per entry
+test/docs.js        checks this README's claims against the code
 .github/workflows/  tag-triggered release pipeline (build + tests gate the release)
 ```
 

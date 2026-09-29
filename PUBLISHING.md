@@ -76,10 +76,13 @@ git tag 2.0.2
 git push origin 2.0.2
 ```
 
-That proves `main.js` reproduces from `src/`, runs the test suite, verifies the
-tag equals the manifest version, and
-publishes a release with `main.js`, `manifest.json` and `styles.css` attached
-as **individual assets**.
+Use the version you are releasing, not the one in this example — the tag must
+equal `version` in `manifest.json`, and CI checks that before it publishes.
+
+That proves `main.js` reproduces from `src/`, runs the test suite, checks the
+README's claims still match the code, verifies the tag equals the manifest
+version, and publishes a release with `main.js`, `manifest.json` and
+`styles.css` attached as **individual assets**.
 
 Two rules the tag must follow:
 
@@ -146,7 +149,8 @@ submission. A later release can be flagged even though the original passed.
       entry in it corresponds to a real tag and release
 - [x] `package.json` has a `build` script, and `npm run build` is deterministic
       so the release reproduces byte-for-byte from source
-- [x] Tests (`npm test`) and mutation verification (`npm run test:mutation`)
+- [x] Tests (`npm test`), documentation verification (`npm run test:docs`) and
+      mutation verification (`npm run test:mutation`)
 - [x] No Node.js or Electron API anywhere, verified by grep — the plugin runs
       unchanged on iOS and Android
 - [x] One network host only (`api.github.com`), reached solely through

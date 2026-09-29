@@ -393,6 +393,236 @@ async function conflictTests() {
 		const r = C.buildMergedContent('text\n\n', 'text', {});
 		assert.strictEqual(r.changed, false);
 	});
+
+	group('which conflicts can be merged at all');
+
+	await test('notes and plain text can be merged', () => {
+		assert.strictEqual(C.isMergeableText('Notes/Plan.md'), true);
+		assert.strictEqual(C.isMergeableText('Notes/Plan.MD'), true);
+		assert.strictEqual(C.isMergeableText('log.txt'), true);
+	});
+
+	await test('attachments cannot — appending to them destroys them', () => {
+		assert.strictEqual(C.isMergeableText('Photos/beach.png'), false);
+		assert.strictEqual(C.isMergeableText('Papers/thesis.pdf'), false);
+		assert.strictEqual(C.isMergeableText('Recordings/voice.m4a'), false);
+	});
+
+	await test('nor can a structured text format Obsidian has to parse', () => {
+		// A markdown callout stapled to the end of these is not a merge, it is
+		// a file the app can no longer open.
+		assert.strictEqual(C.isMergeableText('Board.canvas'), false);
+		assert.strictEqual(C.isMergeableText('data.json'), false);
+	});
+
+	await test('a file with no extension is not assumed to be text', () => {
+		assert.strictEqual(C.isMergeableText('LICENSE'), false);
+	});
+
+	await test('a group is mergeable only when every file in it is', () => {
+		assert.strictEqual(
+			C.groupIsMergeable({ original: 'a.md', copies: [{ path: 'a 2.md' }] }),
+			true
+		);
+		assert.strictEqual(
+			C.groupIsMergeable({ original: 'a.png', copies: [{ path: 'a 2.png' }] }),
+			false
+		);
+	});
+
+	group('resolving a conflict by hand');
+
+	/*
+	 * Drives the two panel buttons against a fake vault. Both write into the
+	 * vault and trash a file, so they are the most destructive thing in the
+	 * plugin that a single click can reach — and until this group existed,
+	 * neither had a test at all.
+	 */
+	function fakeConflictVault(files) {
+		const trashed = [];
+		const byPath = Object.create(null);
+		let mtime = 100;
+		for (const path of Object.keys(files)) {
+			byPath[path] = { path: path, mtime: (mtime += 100), size: files[path].length };
+		}
+		const adapter = {
+			async read(p) {
+				if (!(p in files)) throw new Error('ENOENT ' + p);
+				// Exactly what Obsidian's adapter does: decode as UTF-8.
+				return Buffer.from(files[p]).toString('utf8');
+			},
+			async write(p, text) {
+				/*
+				 * Obsidian's `write` takes a string. Node's Buffer.from is
+				 * happy to accept an ArrayBuffer and quietly do the right
+				 * thing, which the real adapter is not — it would stringify
+				 * it to "[object ArrayBuffer]". Refusing anything but a
+				 * string keeps the fake as strict as the thing it stands in
+				 * for, so a text write of binary content fails here too.
+				 */
+				assert.strictEqual(typeof text, 'string', 'adapter.write takes text, not bytes');
+				files[p] = Buffer.from(text, 'utf8');
+			},
+			async readBinary(p) {
+				if (!(p in files)) throw new Error('ENOENT ' + p);
+				const b = Buffer.from(files[p]);
+				return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
+			},
+			async writeBinary(p, buf) {
+				assert.ok(
+					buf instanceof ArrayBuffer,
+					'adapter.writeBinary takes an ArrayBuffer, not text'
+				);
+				files[p] = Buffer.from(new Uint8Array(buf));
+			},
+		};
+		const p = Object.create(plugin.prototype);
+		p.app = {
+			vault: {
+				adapter: adapter,
+				getAbstractFileByPath: (path) => (path in files ? { path: path } : null),
+			},
+			fileManager: {
+				trashFile: async (f) => {
+					trashed.push(f.path);
+					delete files[f.path];
+				},
+			},
+		};
+		p.lastScan = { byPath: byPath };
+		p.runScan = async () => {};
+		return { plugin: p, files: files, trashed: trashed, byPath: byPath };
+	}
+
+	/** Set an explicit modification time, so "newest" is not left to luck. */
+	function touch(v, path, mtime) {
+		v.byPath[path].mtime = mtime;
+	}
+
+	await test('keeping the newest note copies its text onto the original', async () => {
+		const v = fakeConflictVault({
+			'Notes/Plan.md': Buffer.from('old plan', 'utf8'),
+			'Notes/Plan 2.md': Buffer.from('new plan', 'utf8'),
+		});
+		touch(v, 'Notes/Plan.md', 100);
+		touch(v, 'Notes/Plan 2.md', 200);
+
+		const res = await v.plugin.resolveKeepNewest({
+			original: 'Notes/Plan.md',
+			copies: [{ path: 'Notes/Plan 2.md' }],
+		});
+		assert.strictEqual(res.ok, true);
+		assert.strictEqual(v.files['Notes/Plan.md'].toString('utf8'), 'new plan');
+		assert.deepStrictEqual(v.trashed, ['Notes/Plan 2.md']);
+	});
+
+	await test('keeping the newest ATTACHMENT preserves it byte for byte', async () => {
+		/*
+		 * The regression this exists for, reproduced on a real vault: reading
+		 * a PNG through the text adapter replaces every byte that is not valid
+		 * UTF-8 with U+FFFD, and writing that back over the original destroyed
+		 * the image — while the intact copy was trashed in the same breath.
+		 * The rescue button was the thing doing the damage.
+		 */
+		const older = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01]);
+		const newer = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xd8, 0xfe]);
+		const v = fakeConflictVault({
+			'Photos/beach.png': older,
+			'Photos/beach 2.png': newer,
+		});
+		touch(v, 'Photos/beach.png', 100);
+		touch(v, 'Photos/beach 2.png', 200);
+
+		const res = await v.plugin.resolveKeepNewest({
+			original: 'Photos/beach.png',
+			copies: [{ path: 'Photos/beach 2.png' }],
+		});
+		assert.strictEqual(res.ok, true);
+		assert.ok(
+			Buffer.compare(v.files['Photos/beach.png'], newer) === 0,
+			'expected the winning bytes unchanged, got ' + v.files['Photos/beach.png'].toString('hex')
+		);
+	});
+
+	await test('the original winning is left exactly where it is', async () => {
+		const v = fakeConflictVault({
+			'Plan.md': Buffer.from('kept', 'utf8'),
+			'Plan 2.md': Buffer.from('stale', 'utf8'),
+		});
+		touch(v, 'Plan.md', 300);
+		touch(v, 'Plan 2.md', 100);
+
+		const res = await v.plugin.resolveKeepNewest({
+			original: 'Plan.md',
+			copies: [{ path: 'Plan 2.md' }],
+		});
+		assert.strictEqual(res.ok, true);
+		assert.strictEqual(v.files['Plan.md'].toString('utf8'), 'kept');
+		assert.deepStrictEqual(v.trashed, ['Plan 2.md']);
+	});
+
+	await test('a stranded copy whose original was deleted is restored, not refused', async () => {
+		// "conflicted copy" and ".sync-conflict-" are flagged without needing
+		// the original, so a group of exactly one copy is reachable. Demanding
+		// two candidates answered "Nothing left to resolve" and left the file
+		// stuck under a name nobody wants.
+		const v = fakeConflictVault({
+			'Notes/Plan (conflicted copy 2026-08-01).md': Buffer.from('the only copy', 'utf8'),
+		});
+		const res = await v.plugin.resolveKeepNewest({
+			original: 'Notes/Plan.md',
+			originalExists: false,
+			copies: [{ path: 'Notes/Plan (conflicted copy 2026-08-01).md' }],
+		});
+		assert.strictEqual(res.ok, true);
+		assert.strictEqual(v.files['Notes/Plan.md'].toString('utf8'), 'the only copy');
+		assert.deepStrictEqual(v.trashed, ['Notes/Plan (conflicted copy 2026-08-01).md']);
+	});
+
+	await test('with the original present and nothing beside it, there is nothing to do', async () => {
+		const v = fakeConflictVault({ 'Plan.md': Buffer.from('alone', 'utf8') });
+		const res = await v.plugin.resolveKeepNewest({
+			original: 'Plan.md',
+			copies: [{ path: 'Plan 2.md' }],
+		});
+		assert.strictEqual(res.ok, false);
+		assert.deepStrictEqual(v.trashed, []);
+	});
+
+	await test('merging keeps both bodies and trashes the copy', async () => {
+		const v = fakeConflictVault({
+			'Plan.md': Buffer.from('from the Mac', 'utf8'),
+			'Plan 2.md': Buffer.from('from the phone', 'utf8'),
+		});
+		const res = await v.plugin.resolveMerge({
+			original: 'Plan.md',
+			copies: [{ path: 'Plan 2.md' }],
+		});
+		assert.strictEqual(res.ok, true);
+		const text = v.files['Plan.md'].toString('utf8');
+		assert.ok(text.indexOf('from the Mac') !== -1);
+		assert.ok(text.indexOf('from the phone') !== -1);
+		assert.deepStrictEqual(v.trashed, ['Plan 2.md']);
+	});
+
+	await test('merging an attachment is refused rather than attempted', async () => {
+		const original = Buffer.from([0x25, 0x50, 0x44, 0x46, 0xff, 0xfe]);
+		const v = fakeConflictVault({
+			'Papers/thesis.pdf': original,
+			'Papers/thesis 2.pdf': Buffer.from([0x25, 0x50, 0x44, 0x46, 0x01]),
+		});
+		const res = await v.plugin.resolveMerge({
+			original: 'Papers/thesis.pdf',
+			copies: [{ path: 'Papers/thesis 2.pdf' }],
+		});
+		assert.strictEqual(res.ok, false);
+		assert.ok(/Keep newest/.test(res.message), 'it must name the button that does work');
+		assert.ok(
+			Buffer.compare(v.files['Papers/thesis.pdf'], original) === 0,
+			'nothing may be written'
+		);
+		assert.deepStrictEqual(v.trashed, [], 'and nothing may be trashed');
+	});
 }
 
 /* ================= fingerprint ================= */
@@ -928,6 +1158,27 @@ async function beaconTests() {
 		];
 		const r = C.summarizeDevices(others, { digest: 'd', files: 1 }, now);
 		assert.strictEqual(r[0].stale, true);
+	});
+
+	await test('a device claiming to have checked in next month is stale too', () => {
+		/*
+		 * Read as plain elapsed time a future stamp is negative — fresher than
+		 * anything real — so a device with a fast clock was shown as the most
+		 * current in the vault. freshBeacons and pickPairedBeacon had already
+		 * discounted it by absolute distance; this is the third place that has
+		 * to agree, because it is the one the user reads.
+		 */
+		const now = Date.now();
+		const others = [
+			{ id: 'ph', name: 'iPhone', platform: '', updatedAt: now + 30 * 24 * 3600 * 1000, fingerprint: { digest: 'x', files: 1, bytes: 1 } },
+		];
+		const r = C.summarizeDevices(others, { digest: 'd', files: 1 }, now);
+		assert.strictEqual(r[0].stale, true);
+		assert.strictEqual(
+			C.freshBeacons(others, now).length,
+			0,
+			'and the two rules must give the same answer'
+		);
 	});
 
 	await test('newDeviceId is 8 lowercase alphanumerics and honours the rng', () => {
@@ -2700,6 +2951,58 @@ async function githubTests() {
 		const r = C.shouldPushPath('huge.zip', 50 * 1024 * 1024, {});
 		assert.strictEqual(r.ok, false);
 		assert.ok(r.why.indexOf('larger than') !== -1, r.why);
+		assert.strictEqual(r.code, 'too-large');
+	});
+
+	group('a file that was never sent must not look like one that was');
+
+	/*
+	 * The gap this closes: every skip reason was recorded with a sentence
+	 * explaining it, and then nothing ever read the list. Housekeeping being
+	 * dropped is fine and invisible; an attachment too large to upload being
+	 * dropped is not, because in GitHub-only mode the repository is the only
+	 * copy of it that exists.
+	 */
+
+	await test('routine exclusions are not worth repeating after every sync', () => {
+		const skipped = [
+			{ path: 'Notes/.DS_Store', why: 'macOS folder metadata', code: 'always-excluded' },
+			{ path: '.obsidian/app.json', why: 'notes only', code: 'notes-only' },
+			{ path: 'Archive/old.md', why: 'excluded by your settings', code: 'your-settings' },
+		];
+		assert.deepStrictEqual(C.notableSkips(skipped), []);
+		assert.strictEqual(C.describeSkips(skipped), '');
+	});
+
+	await test('a file too large to upload is always said out loud', () => {
+		const skipped = [
+			{ path: 'Notes/.DS_Store', why: 'macOS folder metadata', code: 'always-excluded' },
+			{ path: 'Media/lecture.mp4', why: 'larger than 40.0 MB', code: 'too-large' },
+		];
+		assert.strictEqual(C.notableSkips(skipped).length, 1);
+		const line = C.describeSkips(skipped);
+		assert.ok(line.indexOf('Media/lecture.mp4') !== -1, line);
+		assert.ok(/NOT in the repository/.test(line), line);
+		assert.ok(/Keep another copy/.test(line), line);
+	});
+
+	await test('the wording counts correctly, and does not list a hundred names', () => {
+		const one = C.describeSkips([{ path: 'a.zip', code: 'too-large', why: 'big' }]);
+		assert.ok(/1 file was too large/.test(one), one);
+		assert.ok(/Keep another copy of it\./.test(one), one);
+
+		const many = [];
+		for (let i = 0; i < 7; i++) many.push({ path: 'f' + i + '.zip', code: 'too-large', why: 'big' });
+		const line = C.describeSkips(many);
+		assert.ok(/7 files were too large/.test(line), line);
+		assert.ok(/and 4 more/.test(line), line);
+		assert.ok(/Keep another copy of them\./.test(line), line);
+	});
+
+	await test('an empty or missing skip list says nothing at all', () => {
+		assert.strictEqual(C.describeSkips([]), '');
+		assert.strictEqual(C.describeSkips(null), '');
+		assert.deepStrictEqual(C.notableSkips(undefined), []);
 	});
 
 	group('push planning');
@@ -4014,6 +4317,38 @@ async function githubTests() {
 		assert.strictEqual(r.errors[0].path, 'locked.md');
 	});
 
+	await test('a file too large to upload survives the sync as a reportable skip', async () => {
+		/*
+		 * End to end, because the gap was in the wiring rather than in any one
+		 * function: collectPushable recorded the skip, githubSync dropped it,
+		 * and nothing downstream could tell that a 60 MB attachment had never
+		 * left the device. In GitHub-only mode that is the only copy of it.
+		 */
+		const gh = fakeGitHub();
+		const v = fakeVault({ 'Welcome.md': 'hello', 'Notes/Second.md': 'more' });
+		const huge = 60 * 1024 * 1024;
+		v.io.listLocal = async () => {
+			const listed = [
+				{ path: 'Welcome.md', size: 5 },
+				{ path: 'Notes/Second.md', size: 4 },
+				{ path: 'Media/lecture.mp4', size: huge },
+			];
+			return G.collectPushable(async () => listed, async (p) => bytes(v.files[p]), {});
+		};
+
+		const res = await syncOnce(gh, v);
+		assert.strictEqual(res.applied, true);
+		assert.deepStrictEqual(
+			Object.keys(gh.filesOn('main')).sort(),
+			['Notes/Second.md', 'Welcome.md'],
+			'the oversized file must not be uploaded'
+		);
+		const notable = C.notableSkips(res.plan.skipped);
+		assert.strictEqual(notable.length, 1, 'and the plan must still carry the skip');
+		assert.strictEqual(notable[0].path, 'Media/lecture.mp4');
+		assert.ok(/NOT in the repository/.test(C.describeSkips(res.plan.skipped)));
+	});
+
 	group('storage modes');
 
 	await test('each mode uses what it says it uses', () => {
@@ -4574,6 +4909,142 @@ async function uiTests() {
 		view.render();
 		return sink;
 	}
+
+	await test('both cards agree on WHICH device is holding more files', () => {
+		/*
+		 * compareFingerprints is not symmetric — its summary names the side
+		 * that has more — and the fingerprint card was handing it the two
+		 * devices the wrong way round. The Devices card, one card above it,
+		 * had them right. So a Mac holding three files more than the phone
+		 * read "This device has 3 more" in one card and "The other device has
+		 * 3 more" in the next. Both cannot be true, and nothing about either
+		 * sentence looks broken.
+		 *
+		 * Asserted through the rendered panel rather than the pure function,
+		 * because the function was never wrong — the call was.
+		 */
+		const mine = Object.assign({}, scan, {
+			fingerprint: { digest: 'aaaaaaaa-bbbbbbbb', files: 10, bytes: 1000, newest: 0 },
+			devices: C.summarizeDevices(
+				[
+					{
+						id: 'other001',
+						name: 'iPhone',
+						platform: 'Mobile',
+						updatedAt: Date.now(),
+						fingerprint: { digest: 'cccccccc-dddddddd', files: 7, bytes: 700 },
+					},
+				],
+				{ digest: 'aaaaaaaa-bbbbbbbb', files: 10, bytes: 1000 },
+				Date.now()
+			),
+		});
+
+		const text = renderPanel('apple', {
+			scan: mine,
+			pairing: {
+				fingerprint: 'cccccccc-dddddddd',
+				fingerprintSource: 'auto',
+				label: 'iPhone',
+				labelSource: 'auto',
+				files: 7,
+				bytes: 700,
+			},
+		}).join('\n');
+
+		const claimsThis = (text.match(/This device has 3 more/g) || []).length;
+		const claimsOther = (text.match(/The other device has 3 more/g) || []).length;
+		assert.strictEqual(
+			claimsOther,
+			0,
+			'this device holds 10 to the other\'s 7, so nothing may say the other has more:\n' + text
+		);
+		assert.strictEqual(
+			claimsThis,
+			2,
+			'expected both the Devices card and the fingerprint card to say so:\n' + text
+		);
+	});
+
+	await test('and when the other device really does hold more, both say that', () => {
+		const mine = Object.assign({}, scan, {
+			fingerprint: { digest: 'aaaaaaaa-bbbbbbbb', files: 4, bytes: 400, newest: 0 },
+			devices: C.summarizeDevices(
+				[
+					{
+						id: 'other001',
+						name: 'iPhone',
+						platform: 'Mobile',
+						updatedAt: Date.now(),
+						fingerprint: { digest: 'cccccccc-dddddddd', files: 9, bytes: 900 },
+					},
+				],
+				{ digest: 'aaaaaaaa-bbbbbbbb', files: 4, bytes: 400 },
+				Date.now()
+			),
+		});
+
+		const text = renderPanel('apple', {
+			scan: mine,
+			pairing: {
+				fingerprint: 'cccccccc-dddddddd',
+				fingerprintSource: 'auto',
+				label: 'iPhone',
+				labelSource: 'auto',
+				files: 9,
+				bytes: 900,
+			},
+		}).join('\n');
+
+		assert.strictEqual((text.match(/The other device has 5 more/g) || []).length, 2, text);
+		assert.strictEqual(text.indexOf('This device has 5 more'), -1, text);
+	});
+
+	await test('the panel says when something was too large to send', () => {
+		/*
+		 * The whole point of carrying the skip list: a file that never reached
+		 * the repository has to look different from one that did. Everything
+		 * else on this card describes what travelled.
+		 */
+		const sink = [];
+		const mod = loadWithFakeObsidian(sink);
+		const p = fakePluginFor('apple', scan);
+		Object.assign(p.github, { mode: 'github', token: 'tok', repo: 'me/vault', lastSyncAt: Date.now() });
+		p.lastSyncSkipped = [
+			{ path: 'Notes/.DS_Store', why: 'macOS folder metadata', code: 'always-excluded' },
+			{ path: 'Media/lecture.mp4', why: 'larger than 40.0 MB', code: 'too-large' },
+		];
+		const view = Object.create(mod.__ui.JemzSyncView.prototype);
+		view.plugin = p;
+		const root = fakeEl('div', null, sink);
+		view.containerEl = { children: [fakeEl('div', null, sink), root] };
+		view.render();
+
+		const text = sink.join('\n');
+		assert.ok(text.indexOf('Media/lecture.mp4') !== -1, 'the oversized file must be named:\n' + text);
+		assert.ok(/NOT in the repository/.test(text), text);
+		assert.strictEqual(
+			text.indexOf('Notes/.DS_Store'),
+			-1,
+			'routine housekeeping must not be reported as a loss:\n' + text
+		);
+	});
+
+	await test('and says nothing at all when everything was sent', () => {
+		const sink = [];
+		const mod = loadWithFakeObsidian(sink);
+		const p = fakePluginFor('apple', scan);
+		Object.assign(p.github, { mode: 'github', token: 'tok', repo: 'me/vault', lastSyncAt: Date.now() });
+		p.lastSyncSkipped = [
+			{ path: 'Notes/.DS_Store', why: 'macOS folder metadata', code: 'always-excluded' },
+		];
+		const view = Object.create(mod.__ui.JemzSyncView.prototype);
+		view.plugin = p;
+		const root = fakeEl('div', null, sink);
+		view.containerEl = { children: [fakeEl('div', null, sink), root] };
+		view.render();
+		assert.strictEqual(sink.join('\n').indexOf('NOT in the repository'), -1);
+	});
 
 	await test('the panel renders on every ecosystem without throwing', () => {
 		for (const eco of ['apple', 'windows', 'android', 'linux', 'unknown']) {

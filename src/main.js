@@ -968,6 +968,56 @@ function buildMergedContent(originalText, copyText, meta) {
 	return { changed: true, text: String(originalText) + banner + String(copyText) };
 }
 
+/**
+ * Extensions whose contents are plain text that a banner can be appended to
+ * without breaking them.
+ *
+ * Deliberately short. A sync engine duplicates attachments exactly as readily
+ * as it duplicates notes, so the conflicts card lists PNGs, PDFs and audio
+ * too — and "append one version to the other" is meaningless for all of them.
+ * A structured text format is no better: a `.canvas` or a `.json` with a
+ * markdown callout stapled to the end is no longer parseable, so Obsidian
+ * stops being able to open it at all. Only formats where trailing prose is
+ * harmless belong here.
+ */
+const MERGEABLE_EXTENSIONS = ['.md', '.markdown', '.txt', '.text'];
+
+/**
+ * Can these two versions be stitched together, or only chosen between?
+ *
+ * "Keep newest" works on anything, because it copies bytes. "Merge both" has
+ * to understand the file, so it is offered only where it is honest.
+ */
+function isMergeableText(path) {
+	const ext = splitPath(path).ext.toLowerCase();
+	return MERGEABLE_EXTENSIONS.indexOf(ext) !== -1;
+}
+
+/** Every path in a conflict group — the original and every duplicate. */
+function conflictGroupPaths(group) {
+	const out = [String((group && group.original) || '')];
+	const copies = (group && group.copies) || [];
+	for (let i = 0; i < copies.length; i++) out.push(copies[i].path);
+	return out;
+}
+
+/**
+ * Is "Merge both" meaningful for this whole group?
+ *
+ * Every member has to be mergeable, not just the original: a `Note.md` sitting
+ * beside a `Note 2.md` is the ordinary case, but the group is keyed on a stem
+ * and an extension, so in practice this asks the same question of each file
+ * and refuses the moment one of them is binary.
+ */
+function groupIsMergeable(group) {
+	const paths = conflictGroupPaths(group);
+	if (!paths.length) return false;
+	for (let i = 0; i < paths.length; i++) {
+		if (!isMergeableText(paths[i])) return false;
+	}
+	return true;
+}
+
 /* ---------------------- fingerprint ---------------------- */
 
 /** FNV-1a. Small, dependency-free, and identical on every device. */
@@ -1049,9 +1099,18 @@ function computeFingerprint(entries, opts) {
 /**
  * Human-readable comparison of two fingerprints.
  *
+ * The order is load-bearing and not symmetric: the summary says which side
+ * holds more, so `a` must be THIS device and `b` the other one. Handed them
+ * the other way round it produces a fluent, confident sentence with the two
+ * devices swapped — the hardest kind of wrong to notice, because nothing
+ * looks broken.
+ *
  * `transport` names whatever is moving the files. It is optional so that the
  * many existing callers keep working, and defaults to wording that is true on
  * every platform rather than to Apple's.
+ *
+ * @param {{digest: string, files: number}} a this device
+ * @param {{digest: string, files: number}} b the device being compared against
  */
 function compareFingerprints(a, b, transport) {
 	if (!a || !b) {
@@ -1184,7 +1243,16 @@ function summarizeDevices(others, localFingerprint, now, staleMs, transport) {
 			name: b.name,
 			platform: b.platform,
 			updatedAt: b.updatedAt,
-			stale: now - (b.updatedAt || 0) > staleMs,
+			/*
+			 * Absolute distance, the same rule freshBeacons and
+			 * pickPairedBeacon already use. Read as plain elapsed time, a
+			 * beacon stamped next month comes out negative — fresher than
+			 * anything real — so a device with a fast clock was presented as
+			 * the most current one in the vault while the naming and pairing
+			 * code, working from the same beacon, had already discounted it.
+			 * A timestamp that cannot be true is not evidence of recency.
+			 */
+			stale: Math.abs(now - (b.updatedAt || 0)) > staleMs,
 			match: cmp.match,
 			summary: cmp.summary,
 			files: b.fingerprint.files,
@@ -2090,38 +2158,86 @@ const GIT_FILE_MODE = '100644';
 /**
  * Should this path be pushed?
  *
- * @returns {{ok: boolean, why: string}} `why` is shown in the preview, so a
- *   skipped file is always accounted for rather than silently missing.
+ * @returns {{ok: boolean, why: string, code: string}} `why` is the sentence a
+ *   person reads. `code` is what the interface sorts on, because the reasons
+ *   are not equal: excluding a `.DS_Store` on every sync is housekeeping
+ *   nobody needs told about, whereas a file too large to upload is work the
+ *   user believes is safe in the repository and is not. Only SKIP_WORTH_SAYING
+ *   reaches the panel.
  */
 function shouldPushPath(path, size, opts) {
 	opts = opts || {};
 	const p = String(path || '').replace(/^\/+/, '');
-	if (!p) return { ok: false, why: 'empty path' };
+	if (!p) return { ok: false, why: 'empty path', code: 'empty' };
 
 	for (let i = 0; i < REPO_ALWAYS_EXCLUDE.length; i++) {
 		if (REPO_ALWAYS_EXCLUDE[i].re.test(p)) {
-			return { ok: false, why: REPO_ALWAYS_EXCLUDE[i].why };
+			return { ok: false, why: REPO_ALWAYS_EXCLUDE[i].why, code: 'always-excluded' };
 		}
 	}
 
 	// Optional: some people want the notes and nothing else.
 	if (opts.notesOnly && p.indexOf('.obsidian/') === 0) {
-		return { ok: false, why: 'Obsidian configuration ("notes only" is on)' };
+		return {
+			ok: false,
+			why: 'Obsidian configuration ("notes only" is on)',
+			code: 'notes-only',
+		};
 	}
 
 	const extra = opts.excludePrefixes || [];
 	for (let i = 0; i < extra.length; i++) {
 		if (extra[i] && p.indexOf(extra[i]) === 0) {
-			return { ok: false, why: 'excluded by your settings' };
+			return { ok: false, why: 'excluded by your settings', code: 'your-settings' };
 		}
 	}
 
 	const max = opts.maxBytes || REPO_MAX_FILE_BYTES;
 	if (size > max) {
-		return { ok: false, why: 'larger than ' + formatBytes(max) };
+		return { ok: false, why: 'larger than ' + formatBytes(max), code: 'too-large' };
 	}
 
-	return { ok: true, why: '' };
+	return { ok: true, why: '', code: '' };
+}
+
+/**
+ * Which skips the user has to be told about.
+ *
+ * Every other reason is something they chose or something they would never
+ * want sent, and repeating it after every sync would bury this one. A file
+ * too large to upload is different in kind: nothing else on the screen
+ * distinguishes it from a file that synced, so in GitHub-only mode — where
+ * the repository is the only copy — silence here means believing an
+ * attachment is safe when it was never sent at all.
+ */
+const SKIP_WORTH_SAYING = ['too-large'];
+
+/** The skipped entries a person needs to see, out of everything that was skipped. */
+function notableSkips(skipped) {
+	const out = [];
+	for (let i = 0; i < (skipped || []).length; i++) {
+		const s = skipped[i];
+		if (s && SKIP_WORTH_SAYING.indexOf(s.code) !== -1) out.push(s);
+	}
+	return out;
+}
+
+/** One line naming what never left the device, or '' when everything did. */
+function describeSkips(skipped) {
+	const notable = notableSkips(skipped);
+	if (!notable.length) return '';
+	const names = notable.slice(0, 3).map(function (s) {
+		return s.path;
+	});
+	return (
+		notable.length +
+		' file' + (notable.length === 1 ? ' was' : 's were') +
+		' too large to send and ' + (notable.length === 1 ? 'is' : 'are') +
+		' NOT in the repository: ' +
+		names.join(', ') +
+		(notable.length > names.length ? ', and ' + (notable.length - names.length) + ' more' : '') +
+		'. Keep another copy of ' + (notable.length === 1 ? 'it' : 'them') + '.'
+	);
 }
 
 /**
@@ -2540,6 +2656,10 @@ const CORE = {
 	findConflicts: findConflicts,
 	chooseWinner: chooseWinner,
 	buildMergedContent: buildMergedContent,
+	isMergeableText: isMergeableText,
+	groupIsMergeable: groupIsMergeable,
+	conflictGroupPaths: conflictGroupPaths,
+	MERGEABLE_EXTENSIONS: MERGEABLE_EXTENSIONS,
 	computeFingerprint: computeFingerprint,
 	compareFingerprints: compareFingerprints,
 	summarizeScan: summarizeScan,
@@ -2606,6 +2726,9 @@ const CORE = {
 
 	/* GitHub, pure half */
 	shouldPushPath: shouldPushPath,
+	notableSkips: notableSkips,
+	describeSkips: describeSkips,
+	SKIP_WORTH_SAYING: SKIP_WORTH_SAYING,
 	buildPushPlan: buildPushPlan,
 	planIsEmpty: planIsEmpty,
 	planIsDestructive: planIsDestructive,
@@ -3075,7 +3198,10 @@ async function collectPushable(listFiles, readBytes, opts) {
 		const e = entries[i];
 		const verdict = shouldPushPath(e.path, e.size, opts);
 		if (!verdict.ok) {
-			skipped.push({ path: e.path, why: verdict.why });
+			/* `code` travels with the reason: it is what lets the panel tell
+			 * routine housekeeping from a file that will never reach the
+			 * repository. Dropping it here left every skip indistinguishable. */
+			skipped.push({ path: e.path, why: verdict.why, code: verdict.code });
 			continue;
 		}
 		try {
@@ -3250,6 +3376,15 @@ async function githubSync(client, repo, branch, io, opts) {
 	const plan = buildSyncPlan(io.base, local, remote);
 	plan.remoteTree = remote;
 	plan.headSha = headSha;
+	/*
+	 * Carried out with the plan, not dropped here. A file the push rules
+	 * refused is absent from `local`, which makes it invisible to every
+	 * sentence the plan produces — so without this the interface can only
+	 * describe what did travel, and a 60 MB attachment that was never sent
+	 * looks exactly like one that was. The caller decides which of these are
+	 * worth repeating; see notableSkips.
+	 */
+	plan.skipped = collected.skipped || [];
 
 	/*
 	 * Last line of defence. Any bug that makes the vault look empty — a failed
@@ -3858,7 +3993,8 @@ function applyPairingAutofill(pairing, others, now) {
  * The single place this plugin touches the clipboard, and it only ever writes.
  * jemzsync never reads it, so nothing you copied from elsewhere is visible
  * here. Every caller is a button or command the user pressed, and what goes
- * across is either a sixteen-character digest or a block of shell commands.
+ * across is either a short digest (`a1b2c3d4-e5f6a7b8`) or a block of shell
+ * commands.
  *
  * Writing can be refused — an unfocused window is enough — so failure falls
  * back to telling the user rather than throwing into a click handler.
@@ -4368,6 +4504,13 @@ class JemzSyncPlugin extends Plugin {
 				}
 			);
 			this.lastSyncError = null;
+			/*
+			 * Remembered for the panel. The skip list is the same whether the
+			 * plan applied or not — it describes what this vault holds that
+			 * the repository will never receive — so it is recorded on every
+			 * outcome rather than only on a successful push.
+			 */
+			this.lastSyncSkipped = (result && result.plan && result.plan.skipped) || [];
 			return result;
 		} finally {
 			this.syncing = false;
@@ -4642,7 +4785,8 @@ class JemzSyncPlugin extends Plugin {
 		const scan = this.lastScan;
 		if (!scan) return { ok: false, message: 'Run a scan first.' };
 
-		if (scan.byPath[group.original]) {
+		const haveOriginal = !!scan.byPath[group.original];
+		if (haveOriginal) {
 			const e = scan.byPath[group.original];
 			candidates.push({
 				path: e.path,
@@ -4655,15 +4799,34 @@ class JemzSyncPlugin extends Plugin {
 			const e = scan.byPath[group.copies[i].path];
 			if (e) candidates.push({ path: e.path, mtime: e.mtime, size: e.size });
 		}
-		if (candidates.length < 2) {
+		/*
+		 * With the original still present there must be something to choose
+		 * between, so two. Without it there is not: a lone
+		 * "Plan (conflicted copy).md" whose original was deleted is a file
+		 * stuck under a name nobody wants, and restoring it to `Plan.md` is
+		 * exactly the resolution being asked for. Demanding two candidates
+		 * there answered "Nothing left to resolve" and left it stranded.
+		 */
+		if (candidates.length < (haveOriginal ? 2 : 1)) {
 			return { ok: false, message: 'Nothing left to resolve.' };
 		}
 
 		const winner = chooseWinner(candidates);
-		const winnerText = await this.app.vault.adapter.read(winner.path);
+		/*
+		 * Copied as bytes, never as text.
+		 *
+		 * `adapter.read` decodes UTF-8 and `adapter.write` re-encodes it, and
+		 * a sync engine duplicates attachments exactly as readily as notes —
+		 * so "Keep newest" on a `Photo 2.png` used to read the image as text,
+		 * replace every byte that is not valid UTF-8 with U+FFFD, write that
+		 * over the original, and then trash the intact copy. The image was
+		 * destroyed by the button offered to rescue it. Bytes round-trip
+		 * whatever the file is, text included.
+		 */
+		const winnerBytes = await this.app.vault.adapter.readBinary(winner.path);
 
 		if (winner.path !== group.original) {
-			await this.app.vault.adapter.write(group.original, winnerText);
+			await this.app.vault.adapter.writeBinary(group.original, winnerBytes);
 		}
 
 		let trashed = 0;
@@ -4693,6 +4856,22 @@ class JemzSyncPlugin extends Plugin {
 	async resolveMerge(group) {
 		const scan = this.lastScan;
 		if (!scan) return { ok: false, message: 'Run a scan first.' };
+
+		/*
+		 * Refused rather than attempted. Merging appends one version to the
+		 * other as text, which for a PNG, a PDF or a `.canvas` means writing
+		 * back a file its own application can no longer open. The button is
+		 * not drawn for these, so reaching here takes a command or a race —
+		 * either way the answer is the same one, and it names the alternative
+		 * that does work.
+		 */
+		if (!groupIsMergeable(group)) {
+			return {
+				ok: false,
+				message:
+					'These are not text files, so there is nothing to merge. Use "Keep newest" to choose one version — it copies the file exactly, byte for byte.',
+			};
+		}
 
 		let text = '';
 		try {
@@ -5384,6 +5563,17 @@ class SyncConfirmModal extends Modal {
 			this.plan.conflict,
 			(c) => c.path
 		);
+		/*
+		 * Shown here too, and not only on the card. This is the screen where
+		 * someone decides whether the repository is a faithful copy of their
+		 * vault, so a file that will never reach it belongs in the same list
+		 * as everything that will.
+		 */
+		section(
+			'Too large to send — these will NOT be in the repository',
+			notableSkips(this.plan.skipped),
+			(s) => s.path + '  (' + s.why + ')'
+		);
 
 		const row = el.createDiv({ cls: 'jemzsync-actions' });
 		const go = row.createEl('button', { text: 'Apply' });
@@ -5589,6 +5779,17 @@ class JemzSyncView extends ItemView {
 			});
 		}
 
+		/*
+		 * What is NOT in the repository. Everything else on this card
+		 * describes files that travelled, so a file too large to upload would
+		 * otherwise be indistinguishable from one that synced — and in
+		 * GitHub-only mode the repository is the only copy there is.
+		 */
+		const skipNote = describeSkips(this.plugin.lastSyncSkipped);
+		if (skipNote) {
+			card.createEl('div', { cls: 'jemzsync-compare is-warn', text: skipNote });
+		}
+
 		const row = card.createDiv({ cls: 'jemzsync-actions' });
 		const sync = row.createEl('button', { text: 'Sync now' });
 		sync.addEventListener('click', async () => {
@@ -5729,10 +5930,19 @@ class JemzSyncView extends ItemView {
 			 * comparison stays honest by reporting only that they differ.
 			 */
 			const remote = { digest: paired.fingerprint, files: paired.files || 0 };
+			/*
+			 * This device first, the other device second — the order
+			 * compareFingerprints documents, and the one the Devices card
+			 * already uses. Reversed, the two cards described the same vaults
+			 * in opposite directions: a Mac holding three files more than the
+			 * phone was told "the other device has 3 more" here while the
+			 * Devices card, one card up, correctly said "this device has 3
+			 * more". Whichever you read, the other was lying.
+			 */
 			const cmp = paired.files
 				? compareFingerprints(
-						remote,
 						fp,
+						remote,
 						transportName(this.plugin.ecosystem, this.plugin.github.mode)
 				  )
 				: {
@@ -5831,11 +6041,24 @@ class JemzSyncView extends ItemView {
 				new Notice(res.message);
 			});
 
-			const mergeBtn = btns.createEl('button', { text: 'Merge both' });
-			mergeBtn.addEventListener('click', async () => {
-				const res = await this.plugin.resolveMerge(group);
-				new Notice(res.message);
-			});
+			/*
+			 * Merging appends one version to the other as text. That is the
+			 * right answer for a note and a destructive one for an attachment,
+			 * so the button is simply absent where it cannot work, with the
+			 * reason said out loud rather than left to be discovered.
+			 */
+			if (groupIsMergeable(group)) {
+				const mergeBtn = btns.createEl('button', { text: 'Merge both' });
+				mergeBtn.addEventListener('click', async () => {
+					const res = await this.plugin.resolveMerge(group);
+					new Notice(res.message);
+				});
+			} else {
+				row.createEl('div', {
+					cls: 'jemzsync-device-meta',
+					text: 'Not a text file, so there is nothing to merge — "Keep newest" copies the chosen version exactly.',
+				});
+			}
 
 			const openBtn = btns.createEl('button', { text: 'Open' });
 			openBtn.addEventListener('click', async () => {
@@ -5937,7 +6160,16 @@ class JemzSyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('Scan every')
-			.setDesc('Minutes between background scans. Set to 0 to scan only on demand.')
+			.setDesc(
+				/*
+				 * The interval is registered once, on load, so a new number
+				 * only takes hold on the next launch. Said here because the
+				 * two other settings with the same constraint say it, and a
+				 * setting that silently does nothing until a restart is
+				 * indistinguishable from one that is broken.
+				 */
+				'Minutes between background scans. Set to 0 to scan only on demand. Takes effect after Obsidian restarts.'
+			)
 			.addText((t) =>
 				t
 					.setPlaceholder('15')
