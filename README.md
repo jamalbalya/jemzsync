@@ -360,11 +360,11 @@ cd jemzsync
 npm test
 ```
 
-450 tests and zero dependencies. The suite covers vault-location detection, the migration plan, conflict grouping and resolution, fingerprinting, device beacons, pairing auto-fill, device naming, ecosystem-neutral wording, and the scanner driven by a fake adapter — including end-to-end simulations of a Mac beacon being read on an iPhone for both the matching and the missing-note case.
+455 tests and zero dependencies. The suite covers vault-location detection, the migration plan, conflict grouping and resolution, fingerprinting, device beacons, pairing auto-fill, device naming, ecosystem-neutral wording, and the scanner driven by a fake adapter — including end-to-end simulations of a Mac beacon being read on an iPhone for both the matching and the missing-note case.
 
 The README is checked too (`npm run test:docs`): command names, the counts quoted here, the versions cited in the prose and every path promised as never-pushed are derived from the code rather than taken on trust, because each of those has been wrong at least once. The release workflow runs it before publishing.
 
-The suite is itself verified by mutation testing (`npm run test:mutation`): 120 deliberate regressions are injected into a temporary copy of the source and all 120 must be caught — including an infinite-loop hang, an auto-filled field overwriting something you typed, Apple wording creeping back into a screen every platform sees, a force-push that would erase another device, an offloaded file being mistaken for a deleted one, and a delete falling back to a permanent removal instead of the trash.
+The suite is itself verified by mutation testing (`npm run test:mutation`): 123 deliberate regressions are injected into a temporary copy of the source and all 123 must be caught — including an infinite-loop hang, an auto-filled field overwriting something you typed, Apple wording creeping back into a screen every platform sees, a force-push that would erase another device, an offloaded file being mistaken for a deleted one, and a delete falling back to a permanent removal instead of the trash.
 
 Layout:
 

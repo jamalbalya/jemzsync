@@ -3999,6 +3999,30 @@ function applyPairingAutofill(pairing, others, now) {
  * Writing can be refused — an unfocused window is enough — so failure falls
  * back to telling the user rather than throwing into a click handler.
  */
+/**
+ * Run what a button does, and make a failure visible.
+ *
+ * An `async` click handler that rejects goes nowhere. Nothing awaits it, so
+ * the exception lands in the developer console and the person who pressed the
+ * button sees the interface do absolutely nothing — which is also what
+ * success looks like when the work is quick. That gap matters most exactly
+ * where it was worst: resolving a conflict writes a file and trashes another,
+ * and "it failed" had the same appearance as "it worked", so the natural next
+ * move was to press it again.
+ *
+ * @param {function} work
+ * @param {string} whatFailed sentence opener, e.g. 'Could not resolve this conflict'
+ * @returns {*} whatever `work` returned, or null when it threw
+ */
+async function runButtonAction(work, whatFailed) {
+	try {
+		return await work();
+	} catch (err) {
+		new Notice(whatFailed + ': ' + String((err && err.message) || err));
+		return null;
+	}
+}
+
 async function copyToClipboard(text, message) {
 	try {
 		await navigator.clipboard.writeText(text);
@@ -4506,9 +4530,12 @@ class JemzSyncPlugin extends Plugin {
 			this.lastSyncError = null;
 			/*
 			 * Remembered for the panel. The skip list is the same whether the
-			 * plan applied or not — it describes what this vault holds that
-			 * the repository will never receive — so it is recorded on every
-			 * outcome rather than only on a successful push.
+			 * plan applied, was already in sync, or is waiting to be
+			 * confirmed — it describes what this vault holds that the
+			 * repository will never receive — so it is recorded for all of
+			 * those rather than only for a push that changed something. A
+			 * sync that threw leaves the previous list standing, which is the
+			 * honest answer: nothing new was learned.
 			 */
 			this.lastSyncSkipped = (result && result.plan && result.plan.skipped) || [];
 			return result;
@@ -5640,11 +5667,15 @@ class JemzSyncView extends ItemView {
 		scanBtn.addEventListener('click', async () => {
 			scanBtn.disabled = true;
 			scanBtn.setText('Scanning…');
-			try {
-				await this.plugin.runScan(false);
-			} finally {
-				scanBtn.disabled = false;
-			}
+			/*
+			 * The label is restored as well as the button. A successful scan
+			 * redraws this whole panel, so the reset is invisible — but a
+			 * failed one does not, and the button was left reading "Scanning…"
+			 * for ever while being perfectly clickable.
+			 */
+			await runButtonAction(() => this.plugin.runScan(false), 'Scan failed');
+			scanBtn.disabled = false;
+			scanBtn.setText('Scan now');
 		});
 
 		if (!scan) {
@@ -6037,8 +6068,11 @@ class JemzSyncView extends ItemView {
 
 			const keepBtn = btns.createEl('button', { text: 'Keep newest' });
 			keepBtn.addEventListener('click', async () => {
-				const res = await this.plugin.resolveKeepNewest(group);
-				new Notice(res.message);
+				const res = await runButtonAction(
+					() => this.plugin.resolveKeepNewest(group),
+					'Could not resolve this conflict'
+				);
+				if (res) new Notice(res.message);
 			});
 
 			/*
@@ -6050,8 +6084,11 @@ class JemzSyncView extends ItemView {
 			if (groupIsMergeable(group)) {
 				const mergeBtn = btns.createEl('button', { text: 'Merge both' });
 				mergeBtn.addEventListener('click', async () => {
-					const res = await this.plugin.resolveMerge(group);
-					new Notice(res.message);
+					const res = await runButtonAction(
+						() => this.plugin.resolveMerge(group),
+						'Could not merge these versions'
+					);
+					if (res) new Notice(res.message);
 				});
 			} else {
 				row.createEl('div', {
@@ -6062,8 +6099,21 @@ class JemzSyncView extends ItemView {
 
 			const openBtn = btns.createEl('button', { text: 'Open' });
 			openBtn.addEventListener('click', async () => {
-				const file = this.plugin.app.vault.getAbstractFileByPath(group.original);
-				if (file) await this.plugin.app.workspace.getLeaf(true).openFile(file);
+				await runButtonAction(async () => {
+					const file = this.plugin.app.vault.getAbstractFileByPath(group.original);
+					/*
+					 * A "conflicted copy" is flagged whether or not the
+					 * original still exists, so this button can genuinely have
+					 * nothing to open — and it used to say nothing at all,
+					 * which reads as a broken button rather than an absent
+					 * file.
+					 */
+					if (!file) {
+						new Notice(group.original + ' is not in the vault — only the copies are.');
+						return;
+					}
+					await this.plugin.app.workspace.getLeaf(true).openFile(file);
+				}, 'Could not open this note');
 			});
 		}
 	}

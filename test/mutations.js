@@ -383,4 +383,13 @@ module.exports = [
 	['a device with a fast clock is shown as the freshest in the vault',
 		'\t\t\tstale: Math.abs(now - (b.updatedAt || 0)) > staleMs,',
 		'\t\t\tstale: now - (b.updatedAt || 0) > staleMs,'],
+	['a button that fails goes silent again (rejection with no caller)',
+		'\t\treturn await work();\n\t} catch (err) {\n\t\tnew Notice(whatFailed',
+		'\t\treturn await work();\n\t} catch (err) {\n\t\tvoid (whatFailed'],
+	['a failed scan leaves the button reading "Scanning..." for ever',
+		"\t\t\tscanBtn.setText('Scan now');",
+		'\t\t\tvoid 0;'],
+	['Open stays silent when there is no original to open',
+		"\t\t\t\t\t\tnew Notice(group.original + ' is not in the vault — only the copies are.');\n\t\t\t\t\t\treturn;",
+		'\t\t\t\t\t\treturn;'],
 ];

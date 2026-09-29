@@ -4648,6 +4648,17 @@ function fakeEl(tag, o, sink) {
 			const fns = node.listeners[type] || [];
 			for (let i = 0; i < fns.length; i++) fns[i]();
 		},
+		/*
+		 * The same, awaited. Most handlers in this plugin are `async`, and
+		 * that is exactly the case worth testing — an async handler that
+		 * rejects has no caller to catch it, so the failure is invisible
+		 * unless the handler deals with it itself. Firing without awaiting
+		 * would let a rejection escape the test as well as the interface.
+		 */
+		fireAsync: async (type) => {
+			const fns = node.listeners[type] || [];
+			for (let i = 0; i < fns.length; i++) await fns[i]();
+		},
 		setAttribute: (k, v) => {
 			node.attrs[k] = v;
 		},
@@ -5044,6 +5055,118 @@ async function uiTests() {
 		view.containerEl = { children: [fakeEl('div', null, sink), root] };
 		view.render();
 		assert.strictEqual(sink.join('\n').indexOf('NOT in the repository'), -1);
+	});
+
+	/* ---- a button that fails must say so ---- */
+
+	/**
+	 * Render a panel holding one conflict and hand back the buttons on it,
+	 * so a click can be fired at a plugin rigged to fail.
+	 */
+	function conflictPanel(resolvers) {
+		const sink = [];
+		const mod = loadWithFakeObsidian(sink);
+		const conflicted = Object.assign({}, scan, {
+			conflicts: [{ original: 'Notes/Plan.md', originalExists: true, copies: [{ path: 'Notes/Plan 2.md', label: 'iCloud duplicate' }] }],
+		});
+		const p = Object.assign(fakePluginFor('apple', conflicted), resolvers);
+		const view = Object.create(mod.__ui.JemzSyncView.prototype);
+		view.plugin = p;
+		const root = fakeEl('div', null, sink);
+		view.containerEl = { children: [fakeEl('div', null, sink), root] };
+		view.render();
+
+		const buttons = [];
+		(function walk(n) {
+			if (n.tag === 'button') buttons.push(n);
+			for (const c of n.children) walk(c);
+		})(root);
+		return { sink: sink, button: (label) => buttons.filter((b) => b.text === label)[0] };
+	}
+
+	await test('a conflict resolution that throws tells the user instead of vanishing', async () => {
+		/*
+		 * The gap: `async () => { const res = await resolve(group); ... }` has
+		 * no caller, so a rejection went to the console and the panel did
+		 * nothing at all — indistinguishable from success on an operation
+		 * that writes one file and trashes another. The obvious next move is
+		 * to press it again.
+		 */
+		const panel = conflictPanel({
+			resolveKeepNewest: async () => {
+				throw new Error('EACCES');
+			},
+		});
+		const btn = panel.button('Keep newest');
+		assert.ok(btn, 'expected a Keep newest button');
+		await assert.doesNotReject(() => btn.fireAsync('click'));
+		const notices = panel.sink.filter((s) => /^\[notice\]/.test(s));
+		assert.strictEqual(notices.length, 1, 'expected exactly one notice, got ' + JSON.stringify(notices));
+		assert.ok(/Could not resolve this conflict/.test(notices[0]), notices[0]);
+		assert.ok(/EACCES/.test(notices[0]), 'and it must name the real cause: ' + notices[0]);
+	});
+
+	await test('a merge that throws does the same', async () => {
+		const panel = conflictPanel({
+			resolveMerge: async () => {
+				throw new Error('disk full');
+			},
+		});
+		await assert.doesNotReject(() => panel.button('Merge both').fireAsync('click'));
+		const notices = panel.sink.filter((s) => /^\[notice\]/.test(s));
+		assert.ok(/Could not merge these versions/.test(notices[0]), JSON.stringify(notices));
+		assert.ok(/disk full/.test(notices[0]), notices[0]);
+	});
+
+	await test('a resolution that succeeds still reports only its own message', async () => {
+		const panel = conflictPanel({
+			resolveKeepNewest: async () => ({ ok: true, message: 'Kept the original.' }),
+		});
+		await panel.button('Keep newest').fireAsync('click');
+		const notices = panel.sink.filter((s) => /^\[notice\]/.test(s));
+		assert.deepStrictEqual(notices, ['[notice] Kept the original.']);
+	});
+
+	await test('Open says so when the original is not in the vault', async () => {
+		const panel = conflictPanel({
+			app: Object.assign(fakePluginFor('apple', scan).app, {
+				vault: { getName: () => 'Notes', adapter: {}, getAbstractFileByPath: () => null },
+			}),
+		});
+		await assert.doesNotReject(() => panel.button('Open').fireAsync('click'));
+		const notices = panel.sink.filter((s) => /^\[notice\]/.test(s));
+		assert.ok(/is not in the vault/.test(notices[0]), JSON.stringify(notices));
+	});
+
+	await test('a failing scan restores the button instead of leaving it mid-sentence', async () => {
+		const sink = [];
+		const mod = loadWithFakeObsidian(sink);
+		const p = fakePluginFor('apple', scan);
+		p.runScan = async () => {
+			throw new Error('adapter gone');
+		};
+		const view = Object.create(mod.__ui.JemzSyncView.prototype);
+		view.plugin = p;
+		const root = fakeEl('div', null, sink);
+		view.containerEl = { children: [fakeEl('div', null, sink), root] };
+		view.render();
+
+		let scanBtn = null;
+		(function walk(n) {
+			if (n.tag === 'button' && n.text === 'Scan now') scanBtn = n;
+			for (const c of n.children) walk(c);
+		})(root);
+		assert.ok(scanBtn, 'expected a Scan now button');
+
+		await assert.doesNotReject(() => scanBtn.fireAsync('click'));
+		assert.ok(
+			sink.some((s) => /^\[notice\].*Scan failed.*adapter gone/.test(s)),
+			'the failure must be reported: ' + JSON.stringify(sink.filter((s) => /notice/.test(s)))
+		);
+		// A successful scan redraws the panel; a failed one does not, so the
+		// button has to put its own label back.
+		assert.strictEqual(scanBtn.text, 'Scan now');
+		assert.strictEqual(scanBtn.disabled, false);
 	});
 
 	await test('the panel renders on every ecosystem without throwing', () => {
